@@ -101,12 +101,10 @@ class CatalogPipeline:
 
         return RunStats(discovered=discovered, queued=queued)
 
-    def collect_one(
-        self, appid: int, *, lease_attempt_count: int | None = None
-    ) -> CollectionResult:
+    def collect_one(self, appid: int, *, lease_token: str | None = None) -> CollectionResult:
         """Verify eligibility first, then persist one app's store metadata."""
-        if lease_attempt_count is None and self.database.job_status("collect", str(appid)):
-            raise ValueError("lease_attempt_count is required for a queued collect job")
+        if lease_token is None and self.database.job_status("collect", str(appid)):
+            raise ValueError("lease_token is required for a queued collect job")
         summary = self.steam.fetch_reviews(appid, "recent", "all", 1)
         timestamp = _utc_now()
         aggregate = {
@@ -127,26 +125,24 @@ class CatalogPipeline:
                     replace_steam_aggregate=True,
                     **aggregate,
                 )
-                self._complete_job(appid, lease_attempt_count, timestamp)
+                self._complete_job(appid, lease_token, timestamp)
             return CollectionResult(appid, "below_verified_threshold", "below_verified_threshold")
 
         details = self.steam.fetch_app_details(appid)
         if details is None:
-            return self._record_skip(
-                appid, None, "unavailable", timestamp, aggregate, lease_attempt_count
-            )
+            return self._record_skip(appid, None, "unavailable", timestamp, aggregate, lease_token)
         if details.type != "game":
             return self._record_skip(
-                appid, details, "not_a_game", timestamp, aggregate, lease_attempt_count
+                appid, details, "not_a_game", timestamp, aggregate, lease_token
             )
         if details.coming_soon is True or details.is_released is False:
             return self._record_skip(
-                appid, details, "unreleased", timestamp, aggregate, lease_attempt_count
+                appid, details, "unreleased", timestamp, aggregate, lease_token
             )
 
         with self.database.transaction():
             self._store_details(details, "eligible", None, timestamp, aggregate)
-            self._complete_job(appid, lease_attempt_count, timestamp)
+            self._complete_job(appid, lease_token, timestamp)
         return CollectionResult(appid, "eligible")
 
     def _record_skip(
@@ -156,7 +152,7 @@ class CatalogPipeline:
         reason: str,
         timestamp: str,
         aggregate: dict[str, int | str | None],
-        lease_attempt_count: int | None,
+        lease_token: str | None,
     ) -> CollectionResult:
         with self.database.transaction():
             if details is None:
@@ -170,15 +166,15 @@ class CatalogPipeline:
                 )
             else:
                 self._store_details(details, "ineligible", reason, timestamp, aggregate)
-            self._complete_job(appid, lease_attempt_count, timestamp)
+            self._complete_job(appid, lease_token, timestamp)
         return CollectionResult(appid, "ineligible", reason)
 
-    def _complete_job(self, appid: int, lease_attempt_count: int | None, timestamp: str) -> None:
-        if lease_attempt_count is not None:
+    def _complete_job(self, appid: int, lease_token: str | None, timestamp: str) -> None:
+        if lease_token is not None:
             self.database.complete_job(
                 "collect",
                 str(appid),
-                expected_attempt_count=lease_attempt_count,
+                expected_lease_token=lease_token,
                 updated_at=timestamp,
             )
 

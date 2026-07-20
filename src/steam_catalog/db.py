@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import secrets
 import sqlite3
 
 from steam_catalog.models import DiscoveryItem, EligibilityStatus
@@ -108,6 +109,7 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
     next_attempt_at TEXT,
     last_error TEXT,
     updated_at TEXT NOT NULL,
+    lease_token TEXT,
     PRIMARY KEY(job_kind, item_key)
 );
 
@@ -193,6 +195,7 @@ class Database:
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported SQLite schema version: {version}")
 
+        self._ensure_sync_job_lease_token()
         self._recover_stale_jobs()
 
     @contextmanager
@@ -581,6 +584,7 @@ class Database:
                     ON CONFLICT(job_kind, item_key) DO UPDATE SET
                         status = 'pending',
                         attempt_count = 0,
+                        lease_token = NULL,
                         next_attempt_at = NULL,
                         last_error = NULL,
                         updated_at = excluded.updated_at
@@ -604,7 +608,8 @@ class Database:
             self.connection.execute(
                 """
                 UPDATE sync_jobs
-                SET status = 'permanent_failure', next_attempt_at = NULL, updated_at = ?
+                SET status = 'permanent_failure', lease_token = NULL,
+                    next_attempt_at = NULL, updated_at = ?
                 WHERE job_kind = ?
                   AND status IN ('pending', 'failed')
                   AND attempt_count >= ?
@@ -639,14 +644,15 @@ class Database:
             ).fetchone()
             if candidate is None:
                 return None
+            lease_token = secrets.token_urlsafe(32)
             self.connection.execute(
                 """
                 UPDATE sync_jobs
                 SET status = 'running', attempt_count = attempt_count + 1,
-                    next_attempt_at = NULL, updated_at = ?
+                    lease_token = ?, next_attempt_at = NULL, updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
                 """,
-                (timestamp, job_kind, candidate["item_key"]),
+                (lease_token, timestamp, job_kind, candidate["item_key"]),
             )
             return self.connection.execute(
                 "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
@@ -658,7 +664,7 @@ class Database:
         job_kind: str,
         item_key: str,
         *,
-        expected_attempt_count: int,
+        expected_lease_token: str,
         updated_at: str | None = None,
     ) -> None:
         """Complete a running job only when the caller still owns its lease."""
@@ -666,16 +672,16 @@ class Database:
             cursor = self.connection.execute(
                 """
                 UPDATE sync_jobs
-                SET status = 'complete', next_attempt_at = NULL, last_error = NULL,
-                    updated_at = ?
+                SET status = 'complete', lease_token = NULL, next_attempt_at = NULL,
+                    last_error = NULL, updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
-                  AND status = 'running' AND attempt_count = ?
+                  AND status = 'running' AND lease_token = ?
                 """,
                 (
                     updated_at or _utc_now(),
                     job_kind,
                     item_key,
-                    expected_attempt_count,
+                    expected_lease_token,
                 ),
             )
             if cursor.rowcount != 1:
@@ -687,7 +693,7 @@ class Database:
         item_key: str,
         error: BaseException | str,
         *,
-        expected_attempt_count: int,
+        expected_lease_token: str,
         next_attempt_at: str,
         max_attempts: int,
         updated_at: str | None = None,
@@ -696,22 +702,31 @@ class Database:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         with self.transaction():
-            permanent = expected_attempt_count >= max_attempts
             cursor = self.connection.execute(
                 """
                 UPDATE sync_jobs
-                SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+                SET status = CASE
+                        WHEN attempt_count >= ? THEN 'permanent_failure'
+                        ELSE 'failed'
+                    END,
+                    lease_token = NULL,
+                    next_attempt_at = CASE
+                        WHEN attempt_count >= ? THEN NULL
+                        ELSE ?
+                    END,
+                    last_error = ?, updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
-                  AND status = 'running' AND attempt_count = ?
+                  AND status = 'running' AND lease_token = ?
                 """,
                 (
-                    "permanent_failure" if permanent else "failed",
-                    None if permanent else next_attempt_at,
+                    max_attempts,
+                    max_attempts,
+                    next_attempt_at,
                     str(error)[:1000],
                     updated_at or _utc_now(),
                     job_kind,
                     item_key,
-                    expected_attempt_count,
+                    expected_lease_token,
                 ),
             )
             if cursor.rowcount != 1:
@@ -851,6 +866,11 @@ class Database:
             (appid,),
         )
 
+    def _ensure_sync_job_lease_token(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(sync_jobs)")}
+        if "lease_token" not in columns:
+            self.connection.execute("ALTER TABLE sync_jobs ADD COLUMN lease_token TEXT")
+
     def _recover_stale_jobs(self) -> None:
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=1)).isoformat()
@@ -861,6 +881,7 @@ class Database:
                     WHEN attempt_count >= ? THEN 'permanent_failure'
                     ELSE 'pending'
                 END,
+                lease_token = NULL,
                 next_attempt_at = NULL,
                 updated_at = ?
             WHERE status = 'running' AND julianday(updated_at) < julianday(?)

@@ -82,6 +82,7 @@ EXPECTED_COLUMNS = {
         "next_attempt_at",
         "last_error",
         "updated_at",
+        "lease_token",
     ],
     "http_cache": [
         "cache_key",
@@ -182,6 +183,7 @@ EXPECTED_TABLE_INFO = {
         ("next_attempt_at", "TEXT", 0, None, 0),
         ("last_error", "TEXT", 0, None, 0),
         ("updated_at", "TEXT", 1, None, 0),
+        ("lease_token", "TEXT", 0, None, 0),
     ],
     "http_cache": [
         ("cache_key", "TEXT", 0, None, 1),
@@ -346,6 +348,43 @@ def test_initialize_is_idempotent(tmp_path):
         db.initialize()
         db.initialize()
         assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_initialize_adds_lease_token_to_existing_version_one_schema(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES(1);
+        CREATE TABLE sync_jobs (
+            job_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(job_kind, item_key)
+        );
+        INSERT INTO sync_jobs VALUES('collect', '10', 'pending', 0, NULL, NULL, 'now');
+        """
+    )
+    connection.close()
+
+    db = Database(path)
+    try:
+        db.initialize()
+
+        assert _column_names(db, "sync_jobs") == EXPECTED_COLUMNS["sync_jobs"]
+        assert (
+            db.connection.execute(
+                "SELECT lease_token FROM sync_jobs WHERE item_key = '10'"
+            ).fetchone()[0]
+            is None
+        )
     finally:
         db.close()
 

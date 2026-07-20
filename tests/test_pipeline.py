@@ -145,9 +145,10 @@ def test_claim_job_is_exclusive_due_and_increments_attempts(tmp_path):
         assert second.claim_job("collect", now="2026-07-20T00:30:00+00:00") is None
 
         row = first.connection.execute(
-            "SELECT status, attempt_count FROM sync_jobs WHERE item_key = '11'"
+            "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '11'"
         ).fetchone()
-        assert tuple(row) == ("running", 1)
+        assert tuple(row[:2]) == ("running", 1)
+        assert row["lease_token"]
     finally:
         second.close()
         first.close()
@@ -161,16 +162,16 @@ def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
         "collect",
         "10",
         error="x" * 2000,
-        expected_attempt_count=first_lease["attempt_count"],
+        expected_lease_token=first_lease["lease_token"],
         next_attempt_at="2026-07-20T00:05:00+00:00",
         max_attempts=2,
         updated_at="2026-07-20T00:00:02+00:00",
     )
 
     row = initialized_db.connection.execute(
-        "SELECT status, length(last_error) FROM sync_jobs WHERE item_key = '10'"
+        "SELECT status, length(last_error), lease_token FROM sync_jobs WHERE item_key = '10'"
     ).fetchone()
-    assert tuple(row) == ("failed", 1000)
+    assert tuple(row) == ("failed", 1000, None)
     assert initialized_db.claim_job("collect", now="2026-07-20T00:04:59+00:00") is None
     second_lease = initialized_db.claim_job("collect", now="2026-07-20T00:05:00+00:00")
     assert second_lease is not None
@@ -179,13 +180,19 @@ def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
         "collect",
         "10",
         error="still failing",
-        expected_attempt_count=second_lease["attempt_count"],
+        expected_lease_token=second_lease["lease_token"],
         next_attempt_at="2026-07-20T00:10:00+00:00",
         max_attempts=2,
         updated_at="2026-07-20T00:05:01+00:00",
     )
 
     assert initialized_db.job_status("collect", "10") == "permanent_failure"
+    assert (
+        initialized_db.connection.execute(
+            "SELECT lease_token FROM sync_jobs WHERE item_key = '10'"
+        ).fetchone()[0]
+        is None
+    )
     assert initialized_db.claim_job("collect", now="2026-07-21T00:00:00+00:00") is None
 
 
@@ -193,9 +200,15 @@ def test_complete_job_records_terminal_state(initialized_db):
     initialized_db.enqueue_job("collect", "10")
     lease = initialized_db.claim_job("collect")
 
-    initialized_db.complete_job("collect", "10", expected_attempt_count=lease["attempt_count"])
+    initialized_db.complete_job("collect", "10", expected_lease_token=lease["lease_token"])
 
     assert initialized_db.job_status("collect", "10") == "complete"
+    assert (
+        initialized_db.connection.execute(
+            "SELECT lease_token FROM sync_jobs WHERE item_key = '10'"
+        ).fetchone()[0]
+        is None
+    )
 
 
 def test_initialize_recovers_running_jobs_stale_for_one_hour(tmp_path):
@@ -212,6 +225,12 @@ def test_initialize_recovers_running_jobs_stale_for_one_hour(tmp_path):
     try:
         reopened.initialize()
         assert reopened.job_status("collect", "10") == "pending"
+        assert (
+            reopened.connection.execute(
+                "SELECT lease_token FROM sync_jobs WHERE item_key = '10'"
+            ).fetchone()[0]
+            is None
+        )
     finally:
         reopened.close()
 
@@ -221,7 +240,7 @@ def test_bootstrap_resumes_at_next_page_and_restart_requeues_work(pipeline_facto
 
     first = pipeline.bootstrap("steamspy", page_limit=1)
     lease = db.claim_job("collect")
-    db.complete_job("collect", "10", expected_attempt_count=lease["attempt_count"])
+    db.complete_job("collect", "10", expected_lease_token=lease["lease_token"])
     resumed = pipeline.bootstrap("steamspy", page_limit=1)
     restarted = pipeline.bootstrap("steamspy", resume=False, page_limit=1)
 
@@ -290,14 +309,14 @@ def test_repeated_steam_fallback_resume_preserves_terminal_game_and_job_states(
     pipeline.bootstrap("steam")
     complete_lease = db.claim_job("collect")
     db.record_game_status(10, "eligible")
-    db.complete_job("collect", "10", expected_attempt_count=complete_lease["attempt_count"])
+    db.complete_job("collect", "10", expected_lease_token=complete_lease["lease_token"])
     permanent_lease = db.claim_job("collect")
     db.record_game_status(11, "ineligible", skip_reason="unavailable")
     db.fail_job(
         "collect",
         "11",
         "not available",
-        expected_attempt_count=permanent_lease["attempt_count"],
+        expected_lease_token=permanent_lease["lease_token"],
         next_attempt_at="2026-07-21T00:00:00+00:00",
         max_attempts=1,
     )
@@ -339,7 +358,7 @@ def test_collect_one_completes_queued_job_with_game(pipeline_factory):
     pipeline.bootstrap("steamspy", page_limit=1)
     lease = db.claim_job("collect")
 
-    result = pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
+    result = pipeline.collect_one(10, lease_token=lease["lease_token"])
 
     assert result.status == "eligible"
     assert db.game_status(10) == "eligible"
@@ -352,11 +371,11 @@ def test_game_and_job_completion_roll_back_together(pipeline_factory, monkeypatc
     lease = db.claim_job("collect")
     complete_job = db.complete_job
 
-    def abort_after_completion(job_kind, item_key, *, expected_attempt_count, updated_at=None):
+    def abort_after_completion(job_kind, item_key, *, expected_lease_token, updated_at=None):
         complete_job(
             job_kind,
             item_key,
-            expected_attempt_count=expected_attempt_count,
+            expected_lease_token=expected_lease_token,
             updated_at=updated_at,
         )
         raise RuntimeError("abort game transaction")
@@ -364,7 +383,7 @@ def test_game_and_job_completion_roll_back_together(pipeline_factory, monkeypatc
     monkeypatch.setattr(db, "complete_job", abort_after_completion)
 
     with pytest.raises(RuntimeError, match="abort game transaction"):
-        pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
+        pipeline.collect_one(10, lease_token=lease["lease_token"])
 
     assert db.game_status(10) == "pending"
     assert db.job_status("collect", "10") == "running"
@@ -426,7 +445,7 @@ def test_stale_worker_cannot_complete_or_fail_a_reclaimed_lease(initialized_db):
 
     with pytest.raises(RuntimeError, match="lease"):
         initialized_db.complete_job(
-            "collect", "10", expected_attempt_count=stale_lease["attempt_count"]
+            "collect", "10", expected_lease_token=stale_lease["lease_token"]
         )
     with pytest.raises(RuntimeError, match="lease"):
         with initialized_db.transaction():
@@ -435,15 +454,19 @@ def test_stale_worker_cannot_complete_or_fail_a_reclaimed_lease(initialized_db):
                 "collect",
                 "10",
                 "stale worker",
-                expected_attempt_count=stale_lease["attempt_count"],
+                expected_lease_token=stale_lease["lease_token"],
                 next_attempt_at="2026-07-21T00:00:00+00:00",
                 max_attempts=3,
             )
 
     row = initialized_db.connection.execute(
-        "SELECT status, attempt_count FROM sync_jobs WHERE item_key = '10'"
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
     ).fetchone()
-    assert tuple(row) == ("running", current_lease["attempt_count"])
+    assert tuple(row) == (
+        "running",
+        current_lease["attempt_count"],
+        current_lease["lease_token"],
+    )
     assert initialized_db.game_status(10) == "pending"
 
 
@@ -455,13 +478,62 @@ def test_stale_pipeline_lease_rolls_back_game_writes(pipeline_factory):
     current_lease = db.claim_job("collect")
 
     with pytest.raises(RuntimeError, match="lease"):
-        pipeline.collect_one(10, lease_attempt_count=stale_lease["attempt_count"])
+        pipeline.collect_one(10, lease_token=stale_lease["lease_token"])
 
     assert db.game_status(10) == "pending"
     row = db.connection.execute(
-        "SELECT status, attempt_count FROM sync_jobs WHERE item_key = '10'"
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
     ).fetchone()
-    assert tuple(row) == ("running", current_lease["attempt_count"])
+    assert tuple(row) == (
+        "running",
+        current_lease["attempt_count"],
+        current_lease["lease_token"],
+    )
+
+
+def test_stale_pipeline_lease_is_rejected_after_explicit_requeue(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)]])
+    pipeline.bootstrap("steamspy", page_limit=1)
+    stale_lease = db.claim_job("collect")
+
+    pipeline.bootstrap("steamspy", resume=False, page_limit=1)
+    requeued = db.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(requeued) == ("pending", 0, None)
+    current_lease = db.claim_job("collect")
+
+    assert stale_lease["attempt_count"] == current_lease["attempt_count"] == 1
+    assert stale_lease["lease_token"] != current_lease["lease_token"]
+    with pytest.raises(RuntimeError, match="lease"):
+        pipeline.collect_one(10, lease_token=stale_lease["lease_token"])
+
+    assert db.game_status(10) == "pending"
+    row = db.connection.execute(
+        "SELECT status, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", current_lease["lease_token"])
+
+
+def test_stale_pipeline_lease_is_rejected_after_discard_and_recreate(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)]])
+    pipeline.bootstrap("steamspy", page_limit=1)
+    stale_lease = db.claim_job("collect")
+
+    db.discard_job("collect", "10")
+    db.enqueue_job("collect", "10")
+    current_lease = db.claim_job("collect")
+
+    assert stale_lease["attempt_count"] == current_lease["attempt_count"] == 1
+    assert stale_lease["lease_token"] != current_lease["lease_token"]
+    with pytest.raises(RuntimeError, match="lease"):
+        pipeline.collect_one(10, lease_token=stale_lease["lease_token"])
+
+    assert db.game_status(10) == "pending"
+    row = db.connection.execute(
+        "SELECT status, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", current_lease["lease_token"])
 
 
 def test_repeated_stale_recovery_exhausts_crashed_job(tmp_path):
@@ -493,11 +565,17 @@ def test_repeated_stale_recovery_exhausts_crashed_job(tmp_path):
 def test_claim_marks_exhausted_pending_job_permanent(initialized_db):
     initialized_db.enqueue_job("collect", "10")
     initialized_db.connection.execute(
-        "UPDATE sync_jobs SET attempt_count = 3 WHERE item_key = '10'"
+        "UPDATE sync_jobs SET attempt_count = 3, lease_token = 'orphaned' WHERE item_key = '10'"
     )
 
     assert initialized_db.claim_job("collect") is None
     assert initialized_db.job_status("collect", "10") == "permanent_failure"
+    assert (
+        initialized_db.connection.execute(
+            "SELECT lease_token FROM sync_jobs WHERE item_key = '10'"
+        ).fetchone()[0]
+        is None
+    )
 
 
 def test_discovery_details_refresh_round_trip_preserves_field_ownership(pipeline_factory):
@@ -517,7 +595,7 @@ def test_discovery_details_refresh_round_trip_preserves_field_ownership(pipeline
     )
     pipeline.bootstrap("steamspy", page_limit=1)
     lease = db.claim_job("collect")
-    pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
+    pipeline.collect_one(10, lease_token=lease["lease_token"])
 
     collected = db.connection.execute(
         "SELECT name, steamspy_positive, steamspy_negative FROM games WHERE appid = 10"
@@ -574,7 +652,7 @@ def test_claim_prioritizes_review_count_then_timezone_safe_age_and_item_key(init
         initialized_db.complete_job(
             "collect",
             lease["item_key"],
-            expected_attempt_count=lease["attempt_count"],
+            expected_lease_token=lease["lease_token"],
         )
 
     assert claimed_keys == ["10", "20", "30", "40", "50"]
