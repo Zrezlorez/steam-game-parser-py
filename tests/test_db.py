@@ -603,3 +603,32 @@ def test_database_uses_row_objects_and_enables_foreign_keys(initialized_db):
 
     assert isinstance(row, sqlite3.Row)
     assert initialized_db.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_collection_queue_size_counts_pending_and_retry_backlog(initialized_db):
+    for appid in (10, 20, 30, 40):
+        initialized_db.enqueue_job("collect", str(appid))
+    initialized_db.connection.execute(
+        "UPDATE sync_jobs SET status = 'failed', next_attempt_at = '2999-01-01T00:00:00Z' "
+        "WHERE item_key = '20'"
+    )
+    initialized_db.connection.execute(
+        "UPDATE sync_jobs SET status = 'permanent_failure' WHERE item_key = '30'"
+    )
+    initialized_db.connection.execute(
+        "UPDATE sync_jobs SET status = 'complete' WHERE item_key = '40'"
+    )
+
+    assert initialized_db.collection_queue_size() == 2
+
+
+def test_game_progress_details_returns_name_and_stored_review_count(initialized_db):
+    initialized_db.upsert_game(
+        appid=10,
+        name="Test Game",
+        eligibility_status="eligible",
+        updated_at="2026-07-20T00:00:00+00:00",
+    )
+
+    assert initialized_db.game_progress_details(10) == ("Test Game", 0)
+    assert initialized_db.game_progress_details(999) == (None, 0)

@@ -1129,6 +1129,35 @@ class Database:
         ).fetchone()
         return None if row is None else row["status"]
 
+    def collection_queue_size(self) -> int:
+        """Return collection jobs that remain eligible for a future claim."""
+        return self.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM sync_jobs
+            WHERE job_kind = 'collect'
+              AND status IN ('pending', 'failed')
+              AND attempt_count < ?
+            """,
+            (self.max_attempts,),
+        ).fetchone()[0]
+
+    def game_progress_details(self, appid: int) -> tuple[str | None, int]:
+        """Return display-safe post-commit details for collection progress."""
+        row = self.connection.execute(
+            """
+            SELECT games.name, COUNT(reviews.recommendation_id) AS review_count
+            FROM games
+            LEFT JOIN reviews ON reviews.appid = games.appid
+            WHERE games.appid = ?
+            GROUP BY games.appid, games.name
+            """,
+            (appid,),
+        ).fetchone()
+        if row is None:
+            return None, 0
+        return row["name"], row["review_count"]
+
     def has_authoritative_verification(self, appid: int) -> bool:
         """Return whether Steam-owned review data proves prior verification."""
         row = self.connection.execute(
