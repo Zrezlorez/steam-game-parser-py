@@ -15,85 +15,98 @@ CREATE TABLE IF NOT EXISTS games (
     appid INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     type TEXT,
-    is_free INTEGER,
-    short_description TEXT,
-    detailed_description TEXT,
+    is_released INTEGER,
     release_date TEXT,
-    required_age INTEGER,
-    developers TEXT,
-    publishers TEXT,
-    genres TEXT,
-    tags TEXT,
-    positive_reviews INTEGER,
-    negative_reviews INTEGER,
-    total_reviews INTEGER,
+    coming_soon INTEGER,
+    short_description_html TEXT,
+    short_description_text TEXT,
+    detailed_description_html TEXT,
+    detailed_description_text TEXT,
+    about_the_game_html TEXT,
+    about_the_game_text TEXT,
+    developers_json TEXT,
+    publishers_json TEXT,
+    languages_json TEXT,
+    platforms_json TEXT,
+    categories_json TEXT,
+    genres_json TEXT,
+    header_image_url TEXT,
+    screenshots_json TEXT,
+    price_json TEXT,
+    steamspy_positive INTEGER,
+    steamspy_negative INTEGER,
+    steam_total_positive INTEGER,
+    steam_total_negative INTEGER,
+    steam_total_reviews INTEGER,
+    review_score INTEGER,
+    review_score_desc TEXT,
     eligibility_status TEXT NOT NULL DEFAULT 'pending',
-    eligibility_reason TEXT,
-    store_data_json TEXT,
-    steamspy_data_json TEXT,
-    created_at TEXT,
+    skip_reason TEXT,
+    metadata_fetched_at TEXT,
+    reviews_fetched_at TEXT,
     updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS user_library (
     appid INTEGER PRIMARY KEY REFERENCES games(appid) ON DELETE CASCADE,
-    playtime_forever INTEGER NOT NULL DEFAULT 0,
-    playtime_2weeks INTEGER,
+    name_at_import TEXT NOT NULL,
+    playtime_forever_minutes INTEGER NOT NULL,
+    playtime_2weeks_minutes INTEGER,
     last_played_at TEXT,
-    added_at TEXT,
-    updated_at TEXT NOT NULL
+    platform_playtime_json TEXT,
+    source_payload_json TEXT NOT NULL,
+    imported_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
-    review_id INTEGER PRIMARY KEY,
+    recommendation_id TEXT PRIMARY KEY,
     appid INTEGER NOT NULL REFERENCES games(appid) ON DELETE CASCADE,
-    author_steamid TEXT,
     language TEXT,
-    voted_up INTEGER,
+    review_text TEXT NOT NULL,
+    voted_up INTEGER NOT NULL,
     votes_up INTEGER,
     votes_funny INTEGER,
     weighted_vote_score REAL,
-    playtime_forever_at_review INTEGER,
-    written_during_early_access INTEGER,
-    received_for_free INTEGER,
-    steam_purchase INTEGER,
     comment_count INTEGER,
-    review_text TEXT NOT NULL,
+    steam_purchase INTEGER,
+    received_for_free INTEGER,
+    written_during_early_access INTEGER,
+    author_steamid TEXT,
+    author_playtime_forever INTEGER,
+    author_playtime_at_review INTEGER,
     created_at TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT,
+    fetched_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS review_samples (
-    id INTEGER PRIMARY KEY,
     appid INTEGER NOT NULL REFERENCES games(appid) ON DELETE CASCADE,
-    review_id INTEGER REFERENCES reviews(review_id) ON DELETE SET NULL,
-    source TEXT NOT NULL,
-    sample_json TEXT NOT NULL,
-    captured_at TEXT NOT NULL
+    recommendation_id TEXT NOT NULL REFERENCES reviews(recommendation_id) ON DELETE CASCADE,
+    sample_kind TEXT NOT NULL CHECK(sample_kind IN (
+        'helpful_positive', 'helpful_negative', 'recent_positive', 'recent_negative'
+    )),
+    sample_rank INTEGER NOT NULL,
+    PRIMARY KEY(appid, recommendation_id, sample_kind)
 );
 
 CREATE TABLE IF NOT EXISTS source_items (
-    id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
-    source_identifier TEXT NOT NULL,
-    appid INTEGER REFERENCES games(appid) ON DELETE SET NULL,
+    appid INTEGER NOT NULL,
+    source_page INTEGER,
     payload_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL,
-    processed_at TEXT,
-    error TEXT,
-    UNIQUE(source, source_identifier)
+    PRIMARY KEY(source, appid)
 );
 
 CREATE TABLE IF NOT EXISTS sync_jobs (
-    id INTEGER PRIMARY KEY,
-    job_type TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    started_at TEXT,
-    finished_at TEXT,
-    details_json TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    job_kind TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(job_kind, item_key)
 );
 
 CREATE TABLE IF NOT EXISTS http_cache (
@@ -101,22 +114,27 @@ CREATE TABLE IF NOT EXISTS http_cache (
     url TEXT NOT NULL,
     status_code INTEGER NOT NULL,
     response_body TEXT NOT NULL,
+    etag TEXT,
+    last_modified TEXT,
     fetched_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS game_search USING fts5(
     name,
+    short_description_text,
+    detailed_description_text,
+    about_the_game_text,
     developers,
     publishers,
     genres,
-    tags,
+    categories,
     content=''
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS review_search USING fts5(
-    author_steamid,
-    language,
+    appid UNINDEXED,
+    recommendation_id UNINDEXED,
     review_text,
     content=''
 );
@@ -125,9 +143,11 @@ CREATE INDEX IF NOT EXISTS games_eligibility_status_updated_at_idx
     ON games(eligibility_status, updated_at);
 CREATE INDEX IF NOT EXISTS user_library_last_played_at_idx ON user_library(last_played_at);
 CREATE INDEX IF NOT EXISTS reviews_appid_created_at_idx ON reviews(appid, created_at);
-CREATE INDEX IF NOT EXISTS review_samples_appid_idx ON review_samples(appid);
-CREATE INDEX IF NOT EXISTS source_items_source_processed_at_idx ON source_items(source, processed_at);
-CREATE INDEX IF NOT EXISTS sync_jobs_status_created_at_idx ON sync_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS review_samples_appid_sample_kind_rank_idx
+    ON review_samples(appid, sample_kind, sample_rank);
+CREATE INDEX IF NOT EXISTS source_items_source_page_idx ON source_items(source, source_page);
+CREATE INDEX IF NOT EXISTS sync_jobs_status_next_attempt_at_idx
+    ON sync_jobs(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS http_cache_expires_at_idx ON http_cache(expires_at);
 """
 
@@ -140,6 +160,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
+        self._savepoint_counter = 0
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
 
@@ -159,7 +180,9 @@ class Database:
                 if "fts5" in str(error).lower():
                     raise RuntimeError("SQLite was built without required FTS5 support") from error
                 raise
-            self.connection.execute("INSERT INTO schema_version(version) VALUES(?)", (SCHEMA_VERSION,))
+            self.connection.execute(
+                "INSERT INTO schema_version(version) VALUES(?)", (SCHEMA_VERSION,)
+            )
             return
 
         version = version_row["version"]
@@ -169,6 +192,20 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """Run a group of writes atomically using SQLite's immediate lock mode."""
+        if self.connection.in_transaction:
+            self._savepoint_counter += 1
+            savepoint = f"steam_catalog_{self._savepoint_counter}"
+            self.connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except BaseException:
+                self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            else:
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
+
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             yield
@@ -185,102 +222,250 @@ class Database:
         name: str,
         eligibility_status: EligibilityStatus | str,
         updated_at: str,
-        developers: str = "",
-        publishers: str = "",
-        genres: str = "",
-        tags: str = "",
+        type: str | None = None,
+        is_released: bool | None = None,
+        release_date: str | None = None,
+        coming_soon: bool | None = None,
+        short_description_html: str | None = None,
+        short_description_text: str | None = None,
+        detailed_description_html: str | None = None,
+        detailed_description_text: str | None = None,
+        about_the_game_html: str | None = None,
+        about_the_game_text: str | None = None,
+        developers_json: str | None = None,
+        publishers_json: str | None = None,
+        languages_json: str | None = None,
+        platforms_json: str | None = None,
+        categories_json: str | None = None,
+        genres_json: str | None = None,
+        header_image_url: str | None = None,
+        screenshots_json: str | None = None,
+        price_json: str | None = None,
+        steamspy_positive: int | None = None,
+        steamspy_negative: int | None = None,
+        steam_total_positive: int | None = None,
+        steam_total_negative: int | None = None,
+        steam_total_reviews: int | None = None,
+        review_score: int | None = None,
+        review_score_desc: str | None = None,
+        skip_reason: str | None = None,
+        metadata_fetched_at: str | None = None,
+        reviews_fetched_at: str | None = None,
     ) -> None:
-        """Persist a game and replace its contentless full-text-search entry."""
+        """Persist approved game metadata and replace its full-text-search entry."""
+        status = (
+            eligibility_status.value
+            if isinstance(eligibility_status, EligibilityStatus)
+            else eligibility_status
+        )
+        values = (
+            appid,
+            name,
+            type,
+            is_released,
+            release_date,
+            coming_soon,
+            short_description_html,
+            short_description_text,
+            detailed_description_html,
+            detailed_description_text,
+            about_the_game_html,
+            about_the_game_text,
+            developers_json,
+            publishers_json,
+            languages_json,
+            platforms_json,
+            categories_json,
+            genres_json,
+            header_image_url,
+            screenshots_json,
+            price_json,
+            steamspy_positive,
+            steamspy_negative,
+            steam_total_positive,
+            steam_total_negative,
+            steam_total_reviews,
+            review_score,
+            review_score_desc,
+            status,
+            skip_reason,
+            metadata_fetched_at,
+            reviews_fetched_at,
+            updated_at,
+        )
         with self.transaction():
             self._delete_game_search_row(appid)
             self.connection.execute(
                 """
-                INSERT INTO games(
-                    appid, name, developers, publishers, genres, tags, eligibility_status, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO games VALUES(
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(appid) DO UPDATE SET
                     name = excluded.name,
-                    developers = excluded.developers,
-                    publishers = excluded.publishers,
-                    genres = excluded.genres,
-                    tags = excluded.tags,
+                    type = excluded.type,
+                    is_released = excluded.is_released,
+                    release_date = excluded.release_date,
+                    coming_soon = excluded.coming_soon,
+                    short_description_html = excluded.short_description_html,
+                    short_description_text = excluded.short_description_text,
+                    detailed_description_html = excluded.detailed_description_html,
+                    detailed_description_text = excluded.detailed_description_text,
+                    about_the_game_html = excluded.about_the_game_html,
+                    about_the_game_text = excluded.about_the_game_text,
+                    developers_json = excluded.developers_json,
+                    publishers_json = excluded.publishers_json,
+                    languages_json = excluded.languages_json,
+                    platforms_json = excluded.platforms_json,
+                    categories_json = excluded.categories_json,
+                    genres_json = excluded.genres_json,
+                    header_image_url = excluded.header_image_url,
+                    screenshots_json = excluded.screenshots_json,
+                    price_json = excluded.price_json,
+                    steamspy_positive = excluded.steamspy_positive,
+                    steamspy_negative = excluded.steamspy_negative,
+                    steam_total_positive = excluded.steam_total_positive,
+                    steam_total_negative = excluded.steam_total_negative,
+                    steam_total_reviews = excluded.steam_total_reviews,
+                    review_score = excluded.review_score,
+                    review_score_desc = excluded.review_score_desc,
                     eligibility_status = excluded.eligibility_status,
+                    skip_reason = excluded.skip_reason,
+                    metadata_fetched_at = excluded.metadata_fetched_at,
+                    reviews_fetched_at = excluded.reviews_fetched_at,
                     updated_at = excluded.updated_at
+                """,
+                values,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO game_search(
+                    rowid, name, short_description_text, detailed_description_text,
+                    about_the_game_text, developers, publishers, genres, categories
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     appid,
                     name,
-                    developers,
-                    publishers,
-                    genres,
-                    tags,
-                    eligibility_status.value
-                    if isinstance(eligibility_status, EligibilityStatus)
-                    else eligibility_status,
-                    updated_at,
+                    short_description_text or "",
+                    detailed_description_text or "",
+                    about_the_game_text or "",
+                    developers_json or "",
+                    publishers_json or "",
+                    genres_json or "",
+                    categories_json or "",
                 ),
-            )
-            self.connection.execute(
-                """
-                INSERT INTO game_search(rowid, name, developers, publishers, genres, tags)
-                VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                (appid, name, developers, publishers, genres, tags),
             )
 
     def upsert_review(
         self,
         *,
-        review_id: int,
+        recommendation_id: str,
         appid: int,
-        author_steamid: str,
-        language: str,
         review_text: str,
-        updated_at: str,
+        voted_up: bool,
+        fetched_at: str,
+        language: str | None = None,
+        votes_up: int | None = None,
+        votes_funny: int | None = None,
+        weighted_vote_score: float | None = None,
+        comment_count: int | None = None,
+        steam_purchase: bool | None = None,
+        received_for_free: bool | None = None,
+        written_during_early_access: bool | None = None,
+        author_steamid: str | None = None,
+        author_playtime_forever: int | None = None,
+        author_playtime_at_review: int | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
     ) -> None:
-        """Persist a review and replace its contentless full-text-search entry."""
+        """Persist approved review metadata and replace its full-text-search entry."""
+        values = (
+            recommendation_id,
+            appid,
+            language,
+            review_text,
+            int(voted_up),
+            votes_up,
+            votes_funny,
+            weighted_vote_score,
+            comment_count,
+            steam_purchase,
+            received_for_free,
+            written_during_early_access,
+            author_steamid,
+            author_playtime_forever,
+            author_playtime_at_review,
+            created_at,
+            updated_at,
+            fetched_at,
+        )
         with self.transaction():
-            self._delete_review_search_row(review_id)
+            self._delete_review_search_row(recommendation_id)
             self.connection.execute(
                 """
-                INSERT INTO reviews(review_id, appid, author_steamid, language, review_text, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
-                ON CONFLICT(review_id) DO UPDATE SET
+                INSERT INTO reviews VALUES(
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(recommendation_id) DO UPDATE SET
                     appid = excluded.appid,
-                    author_steamid = excluded.author_steamid,
                     language = excluded.language,
                     review_text = excluded.review_text,
-                    updated_at = excluded.updated_at
+                    voted_up = excluded.voted_up,
+                    votes_up = excluded.votes_up,
+                    votes_funny = excluded.votes_funny,
+                    weighted_vote_score = excluded.weighted_vote_score,
+                    comment_count = excluded.comment_count,
+                    steam_purchase = excluded.steam_purchase,
+                    received_for_free = excluded.received_for_free,
+                    written_during_early_access = excluded.written_during_early_access,
+                    author_steamid = excluded.author_steamid,
+                    author_playtime_forever = excluded.author_playtime_forever,
+                    author_playtime_at_review = excluded.author_playtime_at_review,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    fetched_at = excluded.fetched_at
                 """,
-                (review_id, appid, author_steamid, language, review_text, updated_at),
+                values,
             )
+            rowid = self.connection.execute(
+                "SELECT rowid FROM reviews WHERE recommendation_id = ?", (recommendation_id,)
+            ).fetchone()[0]
             self.connection.execute(
                 """
-                INSERT INTO review_search(rowid, author_steamid, language, review_text)
+                INSERT INTO review_search(rowid, appid, recommendation_id, review_text)
                 VALUES(?, ?, ?, ?)
                 """,
-                (review_id, author_steamid, language, review_text),
+                (rowid, appid, recommendation_id, review_text),
             )
 
     def _delete_game_search_row(self, appid: int) -> None:
         self.connection.execute(
             """
-            INSERT INTO game_search(game_search, rowid, name, developers, publishers, genres, tags)
-            SELECT 'delete', appid, name, COALESCE(developers, ''), COALESCE(publishers, ''),
-                   COALESCE(genres, ''), COALESCE(tags, '')
+            INSERT INTO game_search(
+                game_search, rowid, name, short_description_text, detailed_description_text,
+                about_the_game_text, developers, publishers, genres, categories
+            )
+            SELECT
+                'delete', appid, name, COALESCE(short_description_text, ''),
+                COALESCE(detailed_description_text, ''), COALESCE(about_the_game_text, ''),
+                COALESCE(developers_json, ''), COALESCE(publishers_json, ''),
+                COALESCE(genres_json, ''), COALESCE(categories_json, '')
             FROM games
             WHERE appid = ?
             """,
             (appid,),
         )
 
-    def _delete_review_search_row(self, review_id: int) -> None:
+    def _delete_review_search_row(self, recommendation_id: str) -> None:
         self.connection.execute(
             """
-            INSERT INTO review_search(review_search, rowid, author_steamid, language, review_text)
-            SELECT 'delete', review_id, COALESCE(author_steamid, ''), COALESCE(language, ''), review_text
+            INSERT INTO review_search(
+                review_search, rowid, appid, recommendation_id, review_text
+            )
+            SELECT 'delete', rowid, appid, recommendation_id, review_text
             FROM reviews
-            WHERE review_id = ?
+            WHERE recommendation_id = ?
             """,
-            (review_id,),
+            (recommendation_id,),
         )

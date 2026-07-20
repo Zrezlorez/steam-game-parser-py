@@ -16,6 +16,16 @@ def test_settings_use_project_database_by_default(monkeypatch):
     assert settings.steamspy_all_interval_seconds == 60.0
 
 
+def test_default_database_is_independent_of_current_working_directory(monkeypatch, tmp_path):
+    monkeypatch.delenv("STEAM_CATALOG_DATABASE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings.from_env()
+
+    project_root = Path(__file__).resolve().parents[1]
+    assert settings.database == (project_root / "data" / "steam_catalog.sqlite3").resolve()
+
+
 def test_explicit_database_overrides_environment(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("STEAM_CATALOG_DATABASE", str(tmp_path / "env.sqlite3"))
     explicit = tmp_path / "explicit.sqlite3"
@@ -56,7 +66,9 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
         ("STEAM_CATALOG_MAX_ATTEMPTS", "0"),
     ],
 )
-def test_settings_reject_non_positive_intervals_and_attempts(monkeypatch, variable: str, value: str):
+def test_settings_reject_non_positive_intervals_and_attempts(
+    monkeypatch, variable: str, value: str
+):
     monkeypatch.setenv(variable, value)
 
     with pytest.raises(ValueError, match="must be positive"):

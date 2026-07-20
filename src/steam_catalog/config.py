@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 
 
+DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "steam_catalog.sqlite3"
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the Steam catalog collector."""
@@ -21,8 +24,13 @@ class Settings:
     @classmethod
     def from_env(cls, database: Path | None = None) -> "Settings":
         """Build settings from ``STEAM_CATALOG_*`` environment variables."""
-        selected_database = database or Path(
-            os.environ.get("STEAM_CATALOG_DATABASE", "data/steam_catalog.sqlite3")
+        environment_database = os.environ.get("STEAM_CATALOG_DATABASE")
+        selected_database = (
+            database
+            if database is not None
+            else Path(environment_database)
+            if environment_database is not None
+            else DEFAULT_DATABASE
         )
         request_timeout_seconds = _float_env("REQUEST_TIMEOUT_SECONDS", 30.0)
         steam_interval_seconds = _float_env("STEAM_INTERVAL_SECONDS", 1.0)
