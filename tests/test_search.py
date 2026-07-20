@@ -139,6 +139,32 @@ def test_game_search_highlights_diacritic_folded_text_in_matching_field(db_with_
     assert result[0]["snippet"] == "Polish your <mark>résumé</mark> for every application"
 
 
+def test_game_search_splits_underscore_query_like_unicode61(db_with_game):
+    db_with_game.add_game(
+        appid=10,
+        name="Catalog Entry",
+        detailed_description_text="Indexed foo bar words",
+    )
+
+    result = db_with_game.search_games("foo_bar", 10)
+
+    assert [row["appid"] for row in result] == [10]
+    assert result[0]["snippet"] == "Indexed <mark>foo</mark> <mark>bar</mark> words"
+
+
+def test_game_search_does_not_expand_sharp_s_when_highlighting(db_with_game):
+    db_with_game.add_game(
+        appid=10,
+        name="Street Names",
+        detailed_description_text="Earlier strasse, later straße.",
+    )
+
+    result = db_with_game.search_games("straße", 10)
+
+    assert [row["appid"] for row in result] == [10]
+    assert result[0]["snippet"] == "Earlier strasse, later <mark>straße</mark>."
+
+
 def test_review_search_returns_game_and_sample_context(db_with_review):
     db_with_review.add_review(
         appid=10,

@@ -2,10 +2,9 @@
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import re
 import secrets
 import sqlite3
 import unicodedata
@@ -15,8 +14,15 @@ from steam_catalog.models import DiscoveryItem, EligibilityStatus, Review
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_ATTEMPTS = 3
-_SEARCH_TOKEN = re.compile(r"\w+", re.UNICODE)
 _SNIPPET_CONTEXT = 80
+
+
+@dataclass(frozen=True)
+class _SearchToken:
+    folded: str
+    start: int
+    end: int
+
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS games (
@@ -1048,39 +1054,33 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _quoted_match_query(query: str) -> tuple[str, tuple[str, ...]]:
-    tokens = tuple(_SEARCH_TOKEN.findall(query))
-    return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens), tokens
+def _quoted_match_query(query: str) -> tuple[str, tuple[_SearchToken, ...]]:
+    tokens = _unicode61_tokens(query)
+    match_query = " ".join(f'"{token.folded.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+    return match_query, tokens
 
 
-def _highlighted_snippet(values: Sequence[str | None], tokens: Sequence[str]) -> str:
-    normalized_tokens = tuple(
-        normalized for token in tokens if (normalized := _normalize_search_text(token)[0])
-    )
-    if not normalized_tokens:
+def _highlighted_snippet(values: Sequence[str | None], query_tokens: Sequence[_SearchToken]) -> str:
+    query_terms = frozenset(token.folded for token in query_tokens)
+    if not query_terms:
         return next((value[:_SNIPPET_CONTEXT] for value in values if value), "")
-    token_pattern = re.compile(
-        rf"(?<!\w)(?:{'|'.join(re.escape(token) for token in normalized_tokens)})(?!\w)"
-    )
     text = next((value for value in values if value), "")
-    normalized_text, source_spans = _normalize_search_text(text)
-    match = token_pattern.search(normalized_text)
+    matches: tuple[_SearchToken, ...] = ()
     for value in values:
         if not value:
             continue
-        candidate_text, candidate_spans = _normalize_search_text(value)
-        candidate_match = token_pattern.search(candidate_text)
-        if candidate_match is not None:
+        candidate_matches = tuple(
+            token for token in _unicode61_tokens(value) if token.folded in query_terms
+        )
+        if candidate_matches:
             text = value
-            normalized_text = candidate_text
-            source_spans = candidate_spans
-            match = candidate_match
+            matches = candidate_matches
             break
-    if match is None:
+    if not matches:
         return text[:_SNIPPET_CONTEXT]
 
-    match_start = source_spans[match.start()][0]
-    match_end = source_spans[match.end() - 1][1]
+    match_start = matches[0].start
+    match_end = matches[0].end
     start = max(0, match_start - _SNIPPET_CONTEXT)
     end = min(len(text), match_end + _SNIPPET_CONTEXT)
     if start:
@@ -1089,14 +1089,12 @@ def _highlighted_snippet(values: Sequence[str | None], tokens: Sequence[str]) ->
     if end < len(text):
         previous_space = text.rfind(" ", match_end, end)
         end = previous_space if previous_space >= match_end else end
-    ranges = [
-        (source_spans[found.start()][0], source_spans[found.end() - 1][1])
-        for found in token_pattern.finditer(normalized_text)
-        if source_spans[found.start()][0] < end and source_spans[found.end() - 1][1] > start
-    ]
     highlighted_parts = []
     cursor = start
-    for highlight_start, highlight_end in ranges:
+    for token in matches:
+        highlight_start, highlight_end = token.start, token.end
+        if highlight_start >= end or highlight_end <= start:
+            continue
         if highlight_start < cursor:
             continue
         highlighted_parts.extend(
@@ -1108,19 +1106,35 @@ def _highlighted_snippet(values: Sequence[str | None], tokens: Sequence[str]) ->
     return f"{'... ' if start else ''}{highlighted}{' ...' if end < len(text) else ''}"
 
 
-def _normalize_search_text(text: str) -> tuple[str, tuple[tuple[int, int], ...]]:
-    normalized = []
-    source_spans: list[tuple[int, int]] = []
-    for source_index, source_character in enumerate(text):
-        folded = unicodedata.normalize("NFKD", source_character.casefold())
-        stripped = "".join(
-            character for character in folded if not unicodedata.combining(character)
-        )
-        if not stripped:
-            if source_spans and unicodedata.category(source_character).startswith("M"):
-                source_start, _ = source_spans[-1]
-                source_spans[-1] = (source_start, source_index + 1)
-            continue
-        normalized.extend(stripped)
-        source_spans.extend((source_index, source_index + 1) for _ in stripped)
-    return "".join(normalized), tuple(source_spans)
+def _unicode61_tokens(text: str) -> tuple[_SearchToken, ...]:
+    tokens: list[_SearchToken] = []
+    folded_parts: list[str] = []
+    token_start: int | None = None
+    token_end = 0
+
+    def append_token() -> None:
+        nonlocal token_start
+        if token_start is not None and (folded := "".join(folded_parts)):
+            tokens.append(_SearchToken(folded, token_start, token_end))
+        folded_parts.clear()
+        token_start = None
+
+    for index, character in enumerate(text):
+        category = unicodedata.category(character)
+        is_token_character = category[0] in {"L", "N"} or category == "Co"
+        if is_token_character:
+            if token_start is None:
+                token_start = index
+            folded_parts.extend(_unicode61_fold(character))
+            token_end = index + 1
+        elif category[0] == "M" and token_start is not None:
+            token_end = index + 1
+        else:
+            append_token()
+    append_token()
+    return tuple(tokens)
+
+
+def _unicode61_fold(character: str) -> str:
+    decomposed = unicodedata.normalize("NFD", character.lower())
+    return "".join(part for part in decomposed if unicodedata.category(part)[0] != "M")
