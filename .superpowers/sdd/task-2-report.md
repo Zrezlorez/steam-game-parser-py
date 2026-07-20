@@ -37,3 +37,14 @@ The inherited pre-implementation HTTP tests were present before production code 
 - RED: `tests/test_http.py::test_zero_cache_ttl_revalidates_on_second_request` observed `len(requests) == 1` instead of `2` under the original truthiness fallback.
 - GREEN: the zero-TTL regression passed, including the second conditional request and `If-None-Match` header; the full suite passed with `33 passed`.
 - Final static checks passed: `C:\Users\zrezl\.codex\visualizations\2026\07\12\019f56e1-af6e-7131-a5de-0885dc372162\steam_catalog_venv\Scripts\python.exe -m ruff check --cache-dir C:\Users\zrezl\.codex\visualizations\2026\07\12\019f56e1-af6e-7131-a5de-0885dc372162\ruff-cache src tests` reported `All checks passed!`; the matching `ruff format --check` command reported `9 files already formatted`.
+
+## Final Task 2 Edge Evidence
+
+- Added `tests/test_http.py::test_429_non_finite_retry_after_uses_bounded_backoff`, parameterized for `Infinity` and `1e309`, and validated the existing first-attempt backoff range of `1.0` through `1.25` seconds.
+- RED: with the prior numeric parser, both cases failed because the captured retry delay was `inf` instead of bounded exponential backoff.
+- GREEN: after importing `math` and accepting numeric delays only when `math.isfinite(delay)` is true, both cases passed with `2 passed`.
+- Focused HTTP suite: `11 passed`.
+- Full suite: `35 passed`.
+- Ruff check: `All checks passed!`.
+- Ruff format check: `9 files already formatted`.
+- All commands used the mandated interpreter at `C:\Users\zrezl\.codex\visualizations\2026\07\12\019f56e1-af6e-7131-a5de-0885dc372162\steam_catalog_venv\Scripts\python.exe`, with the existing project `.venv` site-packages exposed through `PYTHONPATH`; pytest temp and cache directories were kept outside the project.

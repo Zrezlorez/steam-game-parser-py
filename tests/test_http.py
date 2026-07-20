@@ -92,6 +92,22 @@ def test_429_uses_retry_after_before_retrying(http_client_factory):
     assert sleeps == [3.0]
 
 
+@pytest.mark.parametrize("retry_after", ["Infinity", "1e309"])
+def test_429_non_finite_retry_after_uses_bounded_backoff(http_client_factory, retry_after):
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": retry_after}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    sleeps: list[float] = []
+    client = http_client_factory(lambda request: next(responses), sleep=sleeps.append)
+
+    assert client.get_json("https://example.test/data") == {"ok": True}
+    assert len(sleeps) == 1
+    assert 1.0 <= sleeps[0] <= 1.25
+
+
 def test_429_uses_http_date_retry_after_relative_to_injected_clock(http_client_factory):
     now = datetime(2026, 7, 20, 0, 0, 0, tzinfo=UTC)
     responses = iter(

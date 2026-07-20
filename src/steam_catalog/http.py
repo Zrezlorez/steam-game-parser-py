@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import json
+import math
 import random
 import time
 from typing import Any
@@ -175,16 +176,20 @@ class CachedHttpClient:
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:
             try:
-                return max(0.0, float(retry_after))
-            except ValueError:
-                try:
-                    retry_at = parsedate_to_datetime(retry_after)
-                except (TypeError, ValueError, OverflowError):
-                    pass
-                else:
-                    if retry_at.tzinfo is None:
-                        retry_at = retry_at.replace(tzinfo=UTC)
-                    return max(0.0, (retry_at - self._now()).total_seconds())
+                delay = float(retry_after)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(delay):
+                    return max(0.0, delay)
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                return max(0.0, (retry_at - self._now()).total_seconds())
         return self._backoff(attempt)
 
     @staticmethod
