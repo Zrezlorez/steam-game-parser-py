@@ -99,6 +99,29 @@ def test_parse_review_page_reads_aggregate_and_author_fields(load_fixture):
     assert page.reviews[0].updated_at == "2026-07-21T00:00:00+00:00"
 
 
+def test_targeted_review_fetch_accepts_page_local_summary_without_aggregate_totals():
+    payload = {
+        "success": 1,
+        "query_summary": {"num_reviews": 1},
+        "reviews": [
+            {
+                "recommendationid": "negative-1",
+                "review": "Not for me",
+                "voted_up": False,
+            }
+        ],
+    }
+
+    class TargetedReviewHttpClient:
+        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+            return payload
+
+    page = SteamClient(TargetedReviewHttpClient()).fetch_reviews(10, "all", "negative", 5)
+
+    assert (page.total_reviews, page.total_positive, page.total_negative) == (1, 0, 1)
+    assert [review.recommendation_id for review in page.reviews] == ["negative-1"]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

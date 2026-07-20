@@ -86,7 +86,7 @@ class SteamClient:
             cache_ttl=REVIEWS_CACHE_TTL,
             rate_bucket="steam",
         )
-        return parse_review_page(appid, payload)
+        return parse_review_page(appid, payload, require_aggregate=review_type == "all")
 
 
 class _TextExtractor(HTMLParser):
@@ -207,7 +207,12 @@ def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | N
     )
 
 
-def parse_review_page(appid: int, payload: Mapping[str, Any]) -> ReviewPage:
+def parse_review_page(
+    appid: int,
+    payload: Mapping[str, Any],
+    *,
+    require_aggregate: bool = True,
+) -> ReviewPage:
     """Parse Steam aggregate review data and valid review records."""
     summary = payload.get("query_summary")
     source_reviews = payload.get("reviews")
@@ -225,10 +230,20 @@ def parse_review_page(appid: int, payload: Mapping[str, Any]) -> ReviewPage:
         if isinstance(source_review, Mapping)
         if (parsed := _parse_review(appid, source_review)) is not None
     )
+    aggregate_fields = ("total_reviews", "total_positive", "total_negative")
+    if require_aggregate or all(field in summary for field in aggregate_fields):
+        total_reviews = _required_nonnegative_integer(summary.get("total_reviews"))
+        total_positive = _required_nonnegative_integer(summary.get("total_positive"))
+        total_negative = _required_nonnegative_integer(summary.get("total_negative"))
+    else:
+        total_reviews = _required_nonnegative_integer(summary.get("num_reviews"))
+        total_positive = sum(review.voted_up for review in reviews)
+        total_negative = sum(not review.voted_up for review in reviews)
+
     return ReviewPage(
-        total_reviews=_required_nonnegative_integer(summary.get("total_reviews")),
-        total_positive=_required_nonnegative_integer(summary.get("total_positive")),
-        total_negative=_required_nonnegative_integer(summary.get("total_negative")),
+        total_reviews=total_reviews,
+        total_positive=total_positive,
+        total_negative=total_negative,
         review_score=_optional_integer(summary.get("review_score")),
         review_score_desc=_optional_string(summary.get("review_score_desc")),
         reviews=reviews,
