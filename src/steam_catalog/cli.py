@@ -45,7 +45,8 @@ class _CollectionEvent:
     appid: int
     name: str | None
     outcome: CollectionOutcome
-    review_count: int
+    total_reviews: int
+    sample_count: int
     elapsed_seconds: float
     error: str | None = None
 
@@ -90,7 +91,11 @@ class _CollectionProgress:
 
 def _print_collection_event(event: _CollectionEvent) -> None:
     name = event.name or "Unknown name"
-    detail = f", reviews={event.review_count}" if event.outcome == "saved" else ""
+    detail = (
+        f", reviews={event.total_reviews}, samples={event.sample_count}"
+        if event.outcome == "saved"
+        else ""
+    )
     error = f": {event.error}" if event.error else ""
     typer.echo(
         f"[{event.sequence}/{event.total}] {name} (appid {event.appid}) - "
@@ -285,9 +290,7 @@ def run_command(
             typer.echo(f"Queued: {durable.queued}")
         elif phase == "collect":
             typer.echo("Summary")
-            _print_collection_summary(
-                collection_progress, monotonic() - started, interrupted=True
-            )
+            _print_collection_summary(collection_progress, monotonic() - started, interrupted=True)
         else:
             typer.echo(f"Interrupted during {phase}.")
         raise typer.Exit(130) from error
@@ -353,9 +356,7 @@ def _collect_specific_app(
 ) -> None:
     item_key = str(appid)
     lease_token = secrets.token_urlsafe(32)
-    lease = database.requeue_and_claim_specific_job(
-        "collect", item_key, lease_token=lease_token
-    )
+    lease = database.requeue_and_claim_specific_job("collect", item_key, lease_token=lease_token)
     if lease is None:
         raise ValueError(f"Collect job for appid {appid} is already running")
     try:
@@ -424,11 +425,9 @@ def _collect_claimed_job(
             max_attempts=settings.max_attempts,
         )
         job_status = database.job_status("collect", item_key)
-        outcome: CollectionOutcome = (
-            "failed" if job_status == "permanent_failure" else "retry"
-        )
+        outcome: CollectionOutcome = "failed" if job_status == "permanent_failure" else "retry"
         progress.record(item_key, outcome)
-        name, review_count = database.game_progress_details(appid)
+        name, total_reviews, sample_count = database.game_progress_details(appid)
         on_event(
             _CollectionEvent(
                 sequence=sequence,
@@ -436,7 +435,8 @@ def _collect_claimed_job(
                 appid=appid,
                 name=name,
                 outcome=outcome,
-                review_count=review_count,
+                total_reviews=total_reviews,
+                sample_count=sample_count,
                 elapsed_seconds=monotonic() - started,
                 error=str(error),
             )
@@ -445,7 +445,7 @@ def _collect_claimed_job(
 
     outcome = "saved" if result.status == "eligible" else "skipped"
     progress.record(item_key, outcome)
-    name, review_count = database.game_progress_details(appid)
+    name, total_reviews, sample_count = database.game_progress_details(appid)
     on_event(
         _CollectionEvent(
             sequence=sequence,
@@ -453,7 +453,8 @@ def _collect_claimed_job(
             appid=appid,
             name=name,
             outcome=outcome,
-            review_count=review_count,
+            total_reviews=total_reviews,
+            sample_count=sample_count,
             elapsed_seconds=monotonic() - started,
         )
     )
@@ -510,15 +511,23 @@ def collect_command(
 def refresh_command(
     context: typer.Context,
     older_than_days: Annotated[int, typer.Option("--older-than-days", min=1)] = 30,
+    reason: Annotated[str | None, typer.Option("--reason")] = None,
     failed: Annotated[bool, typer.Option("--failed")] = False,
 ) -> None:
     """Queue stale catalog records for collection again."""
     settings: Settings = context.obj
+    if reason is not None:
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("reason must not be empty")
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=older_than_days)
     with _database(settings) as database:
         scheduled = database.schedule_refresh(
-            cutoff.isoformat(), include_failed=failed, updated_at=now.isoformat()
+            cutoff.isoformat(),
+            reason=reason,
+            include_failed=failed,
+            updated_at=now.isoformat(),
         )
     typer.echo(f"Scheduled: {scheduled}")
 

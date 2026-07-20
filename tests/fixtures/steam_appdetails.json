@@ -16,7 +16,7 @@
       "genres": [{"id": "23", "description": "Indie"}],
       "header_image": "https://cdn.example.test/header.jpg",
       "screenshots": [{"id": 1, "path_full": "https://cdn.example.test/one.jpg"}],
-      "price_overview": {"currency": "USD", "initial": 999, "final": 499}
+      "price_overview": {"currency": "KZT", "initial": 999, "final": 499}
     }
   }
 }

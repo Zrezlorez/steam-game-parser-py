@@ -36,6 +36,7 @@ CSV_COLUMNS = (
     "detailed_description",
     "about_the_game",
     "header_image_url",
+    "prices",
 )
 
 _JSON_COLUMNS = {
@@ -46,7 +47,7 @@ _JSON_COLUMNS = {
     "categories_json": "categories",
     "genres_json": "genres",
     "screenshots_json": "screenshots",
-    "price_json": "price",
+    "prices_json": "prices",
 }
 _GAME_BOOLEAN_COLUMNS = ("is_released", "coming_soon")
 _REVIEW_BOOLEAN_COLUMNS = (
@@ -169,6 +170,9 @@ def _csv_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "detailed_description": record["detailed_description_text"],
         "about_the_game": record["about_the_game_text"],
         "header_image_url": record["header_image_url"],
+        "prices": ""
+        if record["prices"] is None
+        else json.dumps(record["prices"], ensure_ascii=False, separators=(",", ":")),
     }
 
 

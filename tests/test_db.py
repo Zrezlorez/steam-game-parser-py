@@ -28,7 +28,7 @@ EXPECTED_COLUMNS = {
         "genres_json",
         "header_image_url",
         "screenshots_json",
-        "price_json",
+        "prices_json",
         "steamspy_positive",
         "steamspy_negative",
         "steam_total_positive",
@@ -118,7 +118,7 @@ EXPECTED_TABLE_INFO = {
         ("genres_json", "TEXT", 0, None, 0),
         ("header_image_url", "TEXT", 0, None, 0),
         ("screenshots_json", "TEXT", 0, None, 0),
-        ("price_json", "TEXT", 0, None, 0),
+        ("prices_json", "TEXT", 0, None, 0),
         ("steamspy_positive", "INTEGER", 0, None, 0),
         ("steamspy_negative", "INTEGER", 0, None, 0),
         ("steam_total_positive", "INTEGER", 0, None, 0),
@@ -347,7 +347,7 @@ def test_initialize_is_idempotent(tmp_path):
     try:
         db.initialize()
         db.initialize()
-        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
     finally:
         db.close()
 
@@ -359,6 +359,13 @@ def test_initialize_adds_lease_token_to_existing_version_one_schema(tmp_path):
         """
         CREATE TABLE schema_version (version INTEGER NOT NULL);
         INSERT INTO schema_version VALUES(1);
+        CREATE TABLE games (
+            appid INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            price_json TEXT,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO games VALUES(10, 'Legacy', '{"currency":"RUB","final":100}', 'now');
         CREATE TABLE sync_jobs (
             job_kind TEXT NOT NULL,
             item_key TEXT NOT NULL,
@@ -378,6 +385,10 @@ def test_initialize_adds_lease_token_to_existing_version_one_schema(tmp_path):
     try:
         db.initialize()
 
+        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert "price_json" not in _column_names(db, "games")
+        assert "prices_json" in _column_names(db, "games")
+        assert db.connection.execute("SELECT prices_json FROM games").fetchone()[0] is None
         assert _column_names(db, "sync_jobs") == EXPECTED_COLUMNS["sync_jobs"]
         assert (
             db.connection.execute(
@@ -622,13 +633,21 @@ def test_collection_queue_size_counts_pending_and_retry_backlog(initialized_db):
     assert initialized_db.collection_queue_size() == 2
 
 
-def test_game_progress_details_returns_name_and_stored_review_count(initialized_db):
+def test_game_progress_details_returns_total_reviews_and_stored_sample_count(initialized_db):
     initialized_db.upsert_game(
         appid=10,
         name="Test Game",
         eligibility_status="eligible",
         updated_at="2026-07-20T00:00:00+00:00",
+        steam_total_reviews=124176,
+    )
+    initialized_db.upsert_review(
+        recommendation_id="sample-1",
+        appid=10,
+        review_text="Useful",
+        voted_up=True,
+        fetched_at="2026-07-20T00:00:00+00:00",
     )
 
-    assert initialized_db.game_progress_details(10) == ("Test Game", 0)
-    assert initialized_db.game_progress_details(999) == (None, 0)
+    assert initialized_db.game_progress_details(10) == ("Test Game", 124176, 1)
+    assert initialized_db.game_progress_details(999) == (None, 0, 0)

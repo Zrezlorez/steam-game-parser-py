@@ -1,4 +1,6 @@
+from copy import deepcopy
 from datetime import timedelta
+import json
 
 import pytest
 
@@ -69,7 +71,7 @@ def test_parse_app_details_keeps_html_and_search_text(load_fixture):
     assert details.genres_json == '[{"description":"Indie","id":"23"}]'
     assert details.header_image_url == "https://cdn.example.test/header.jpg"
     assert details.screenshots_json == '[{"id":1,"path_full":"https://cdn.example.test/one.jpg"}]'
-    assert details.price_json == '{"currency":"USD","final":499,"initial":999}'
+    assert details.prices_json is None
 
 
 def test_parse_app_details_returns_none_for_missing_app_and_rejects_malformed_response():
@@ -80,6 +82,72 @@ def test_parse_app_details_returns_none_for_missing_app_and_rejects_malformed_re
 
     with pytest.raises(ValueError, match="app details"):
         parse_app_details(10, {"10": {"success": True, "data": {}}})
+
+
+def test_fetch_app_details_uses_kz_metadata_and_collects_three_currency_prices(load_fixture):
+    fixture = load_fixture("steam_appdetails.json")
+
+    class RegionalHttpClient:
+        def __init__(self):
+            self.countries = []
+
+        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+            self.countries.append(params["cc"])
+            payload = deepcopy(fixture)
+            currency = {"KZ": "KZT", "US": "USD", "UA": "UAH"}[params["cc"]]
+            payload["10"]["data"]["price_overview"]["currency"] = currency
+            return payload
+
+    http = RegionalHttpClient()
+
+    details = SteamClient(http).fetch_app_details(10)
+
+    assert details is not None
+    assert details.name == "Drill Builder"
+    assert http.countries == ["KZ", "US", "UA"]
+    assert json.loads(details.prices_json) == {
+        "KZT": {"currency": "KZT", "initial": 999, "final": 499},
+        "USD": {"currency": "USD", "initial": 999, "final": 499},
+        "UAH": {"currency": "UAH", "initial": 999, "final": 499},
+    }
+
+
+def test_fetch_app_details_uses_kz_as_availability_authority():
+    class UnavailableHttpClient:
+        def __init__(self):
+            self.countries = []
+
+        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+            self.countries.append(params["cc"])
+            return {"10": {"success": False}}
+
+    http = UnavailableHttpClient()
+
+    assert SteamClient(http).fetch_app_details(10) is None
+    assert http.countries == ["KZ"]
+
+
+def test_fetch_app_details_keeps_missing_region_and_free_price_explicit(load_fixture):
+    fixture = load_fixture("steam_appdetails.json")
+
+    class MixedHttpClient:
+        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+            if params["cc"] == "US":
+                return {"10": {"success": False}}
+            payload = deepcopy(fixture)
+            if params["cc"] == "UA":
+                payload["10"]["data"].pop("price_overview")
+                payload["10"]["data"]["is_free"] = True
+            return payload
+
+    details = SteamClient(MixedHttpClient()).fetch_app_details(10)
+
+    assert details is not None
+    assert json.loads(details.prices_json) == {
+        "KZT": {"currency": "KZT", "initial": 999, "final": 499},
+        "USD": None,
+        "UAH": {"currency": "UAH", "initial": 0, "final": 0, "discount_percent": 0},
+    }
 
 
 def test_parse_review_page_reads_aggregate_and_author_fields(load_fixture):
@@ -174,7 +242,13 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
         def get_json(self, url, *, params, cache_ttl, rate_bucket):
             self.calls.append((url, dict(params), cache_ttl, rate_bucket))
             if "appdetails" in url:
-                return load_fixture("steam_appdetails.json")
+                payload = deepcopy(load_fixture("steam_appdetails.json"))
+                payload["10"]["data"]["price_overview"]["currency"] = {
+                    "KZ": "KZT",
+                    "US": "USD",
+                    "UA": "UAH",
+                }[params["cc"]]
+                return payload
             if "reviews" in url:
                 return load_fixture("steam_reviews.json")
             return {"applist": {"apps": [{"appid": "10", "name": "Drill Builder"}, {"appid": 0}]}}
@@ -194,7 +268,19 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
         ),
         (
             "https://store.steampowered.com/api/appdetails",
-            {"appids": "10"},
+            {"appids": "10", "cc": "KZ"},
+            timedelta(days=7),
+            "steam",
+        ),
+        (
+            "https://store.steampowered.com/api/appdetails",
+            {"appids": "10", "cc": "US"},
+            timedelta(days=7),
+            "steam",
+        ),
+        (
+            "https://store.steampowered.com/api/appdetails",
+            {"appids": "10", "cc": "UA"},
             timedelta(days=7),
             "steam",
         ),

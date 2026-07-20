@@ -23,7 +23,7 @@ def populated_db(initialized_db):
             about_the_game_text="Plain about description",
             developers_json=json.dumps([f"Studio {appid}"], ensure_ascii=False),
             platforms_json=json.dumps({"windows": True}),
-            price_json=json.dumps({"currency": "USD", "final": appid}),
+            prices_json=json.dumps({"KZT": {"currency": "KZT", "final": appid}}),
             steam_total_reviews=appid + 5,
         )
     initialized_db.upsert_library_entry(
@@ -70,7 +70,8 @@ def test_jsonl_export_decodes_metadata_and_includes_reviews_only_when_requested(
     first = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert first["developers"] == ["Studio 10"]
     assert first["platforms"] == {"windows": True}
-    assert first["price"] == {"currency": "USD", "final": 10}
+    assert first["prices"] == {"KZT": {"currency": "KZT", "final": 10}}
+    assert "price" not in first
     assert first["library"]["platform_playtimes"] == {"windows": 120, "linux": 3}
     assert first["reviews"][0]["recommendation_id"] == "review-10"
     assert first["reviews"][0]["review_text"] == "Excellent game"
@@ -89,6 +90,7 @@ def test_csv_export_uses_plain_text_and_stable_columns(populated_db, tmp_path):
     assert rows[0]["owned"] == "1"
     assert rows[1]["owned"] == "0"
     assert rows[0]["short_description"] == "Plain short description"
+    assert json.loads(rows[0]["prices"]) == {"KZT": {"currency": "KZT", "final": 10}}
     assert "<p>" not in text
 
 

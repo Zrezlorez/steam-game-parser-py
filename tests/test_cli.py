@@ -192,6 +192,64 @@ def test_refresh_schedules_only_old_rows_and_optionally_permanent_failures(tmp_p
     database.close()
 
 
+def test_refresh_reason_schedules_exact_matches_without_age_cutoff(tmp_path: Path):
+    path = tmp_path / "refresh-reason.sqlite3"
+    database = _open_database(path)
+    for appid, reason in ((10, "unavailable"), (11, "unreleased"), (12, "unavailable")):
+        database.record_game_status(
+            appid,
+            "ineligible",
+            skip_reason=reason,
+            reviews_fetched_at="2999-01-01T00:00:00+00:00",
+            replace_steam_aggregate=True,
+            updated_at="2999-01-01T00:00:00+00:00",
+        )
+    database.enqueue_job("collect", "12")
+    database.connection.execute(
+        "UPDATE sync_jobs SET status = 'running', lease_token = 'owned' WHERE item_key = '12'"
+    )
+    database.close()
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "refresh", "--reason", "unavailable"],
+    )
+
+    assert result.exit_code == 0
+    assert "scheduled: 1" in result.stdout.lower()
+    database = _open_database(path)
+    assert database.job_status("collect", "10") == "pending"
+    assert database.job_status("collect", "11") is None
+    assert database.job_status("collect", "12") == "running"
+    database.close()
+
+
+def test_refresh_reason_unknown_and_empty_values_are_safe(tmp_path: Path):
+    path = tmp_path / "refresh-reason-validation.sqlite3"
+    database = _open_database(path)
+    database.record_game_status(
+        10,
+        "ineligible",
+        skip_reason="unavailable",
+        updated_at="2026-07-20T00:00:00+00:00",
+    )
+    database.close()
+
+    unknown = runner.invoke(
+        app,
+        ["--database", str(path), "refresh", "--reason", "typo"],
+    )
+    empty = runner.invoke(
+        app,
+        ["--database", str(path), "refresh", "--reason", "   "],
+    )
+
+    assert unknown.exit_code == 0
+    assert "scheduled: 0" in unknown.stdout.lower()
+    assert empty.exit_code == 1
+    assert "reason must not be empty" in empty.stdout.lower()
+
+
 def test_import_library_reports_concise_data_error(tmp_path: Path):
     path = tmp_path / "bad.json"
     path.write_text("not json", encoding="utf-8")
@@ -248,9 +306,7 @@ def test_import_library_and_export_are_wired_offline(tmp_path: Path):
 
 def test_bootstrap_delegates_without_printing_payloads(tmp_path: Path, monkeypatch):
     class FakePipeline:
-        def bootstrap(
-            self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
-        ):
+        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None, on_progress=None):
             assert (source, resume, page_limit) == ("steamspy", True, 2)
             return RunStats(discovered=3, queued=2)
 
@@ -427,9 +483,7 @@ def test_run_interrupt_releases_active_collection_job(tmp_path: Path, monkeypatc
 
 def test_bootstrap_keyboard_interrupt_reports_progress_and_exits_130(tmp_path: Path, monkeypatch):
     class InterruptingPipeline:
-        def bootstrap(
-            self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
-        ):
+        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None, on_progress=None):
             raise KeyboardInterrupt
 
     @contextmanager
@@ -1053,7 +1107,7 @@ def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch
 
     assert result.exit_code == 0
     assert "eligible: 1" in result.stdout.lower()
-    assert "[1/1] Garry's Mod (appid 4000) - saved, reviews=0," in result.stdout
+    assert "[1/1] Garry's Mod (appid 4000) - saved, reviews=0, samples=0," in result.stdout
     assert "review text" not in result.stdout.lower()
 
 
@@ -1084,8 +1138,8 @@ def test_collect_prints_one_post_commit_line_per_game(tmp_path: Path, monkeypatc
     result = runner.invoke(app, ["--database", str(path), "collect"])
 
     assert result.exit_code == 0
-    assert "[1/2] Game 10 (appid 10) - saved, reviews=0," in result.stdout
-    assert "[2/2] Game 20 (appid 20) - saved, reviews=0," in result.stdout
+    assert "[1/2] Game 10 (appid 10) - saved, reviews=0, samples=0," in result.stdout
+    assert "[2/2] Game 20 (appid 20) - saved, reviews=0, samples=0," in result.stdout
 
 
 def test_collect_prints_retry_only_after_failure_is_durable(tmp_path: Path, monkeypatch):

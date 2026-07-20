@@ -53,7 +53,7 @@ class GameDetails:
     genres_json: str | None = None
     header_image_url: str | None = None
     screenshots_json: str | None = None
-    price_json: str | None = None
+    prices_json: str | None = None
 
 
 @dataclass(frozen=True)

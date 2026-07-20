@@ -12,7 +12,7 @@ import unicodedata
 from steam_catalog.models import DiscoveryItem, EligibilityStatus, Review
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 3
 _SNIPPET_CONTEXT = 80
 
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS games (
     genres_json TEXT,
     header_image_url TEXT,
     screenshots_json TEXT,
-    price_json TEXT,
+    prices_json TEXT,
     steamspy_positive INTEGER,
     steamspy_negative INTEGER,
     steam_total_positive INTEGER,
@@ -166,6 +166,12 @@ CREATE INDEX IF NOT EXISTS sync_jobs_status_next_attempt_at_idx
 CREATE INDEX IF NOT EXISTS http_cache_expires_at_idx ON http_cache(expires_at);
 """
 
+MIGRATION_2 = """
+ALTER TABLE games DROP COLUMN price_json;
+ALTER TABLE games ADD COLUMN prices_json TEXT;
+UPDATE schema_version SET version = 2;
+"""
+
 
 class Database:
     """Connection wrapper that owns schema initialization and atomic writes."""
@@ -203,7 +209,9 @@ class Database:
             )
         else:
             version = version_row["version"]
-            if version != SCHEMA_VERSION:
+            if version == 1:
+                self.connection.executescript(MIGRATION_2)
+            elif version != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported SQLite schema version: {version}")
 
         self._ensure_sync_job_lease_token()
@@ -299,7 +307,7 @@ class Database:
         genres_json: str | None = None,
         header_image_url: str | None = None,
         screenshots_json: str | None = None,
-        price_json: str | None = None,
+        prices_json: str | None = None,
         steamspy_positive: int | None = None,
         steamspy_negative: int | None = None,
         steam_total_positive: int | None = None,
@@ -338,7 +346,7 @@ class Database:
             genres_json,
             header_image_url,
             screenshots_json,
-            price_json,
+            prices_json,
             steamspy_positive,
             steamspy_negative,
             steam_total_positive,
@@ -356,7 +364,18 @@ class Database:
             self._delete_game_search_row(appid)
             self.connection.execute(
                 """
-                INSERT INTO games VALUES(
+                INSERT INTO games(
+                    appid, name, type, is_released, release_date, coming_soon,
+                    short_description_html, short_description_text,
+                    detailed_description_html, detailed_description_text,
+                    about_the_game_html, about_the_game_text, developers_json,
+                    publishers_json, languages_json, platforms_json, categories_json,
+                    genres_json, header_image_url, screenshots_json, prices_json,
+                    steamspy_positive, steamspy_negative, steam_total_positive,
+                    steam_total_negative, steam_total_reviews, review_score,
+                    review_score_desc, eligibility_status, skip_reason,
+                    metadata_fetched_at, reviews_fetched_at, updated_at
+                ) VALUES(
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?
                 )
@@ -380,7 +399,7 @@ class Database:
                     genres_json = excluded.genres_json,
                     header_image_url = excluded.header_image_url,
                     screenshots_json = excluded.screenshots_json,
-                    price_json = excluded.price_json,
+                    prices_json = excluded.prices_json,
                     steamspy_positive = COALESCE(
                         excluded.steamspy_positive, games.steamspy_positive
                     ),
@@ -754,10 +773,11 @@ class Database:
         self,
         cutoff: str,
         *,
+        reason: str | None = None,
         include_failed: bool = False,
         updated_at: str | None = None,
     ) -> int:
-        """Queue games with stale or unknown authoritative Steam verification."""
+        """Queue games selected by age or an exact skip reason."""
         timestamp = updated_at or _utc_now()
         with self.transaction():
             rows = self.connection.execute(
@@ -769,14 +789,20 @@ class Database:
                  AND sync_jobs.item_key = CAST(games.appid AS TEXT)
                 WHERE (
                         (
-                            games.reviews_fetched_at IS NULL
-                            OR julianday(games.reviews_fetched_at) < julianday(?)
+                            (
+                                ? IS NULL
+                                AND (
+                                    games.reviews_fetched_at IS NULL
+                                    OR julianday(games.reviews_fetched_at) < julianday(?)
+                                )
+                            )
+                            OR (? IS NOT NULL AND games.skip_reason = ?)
                         )
                     AND COALESCE(sync_jobs.status, '') NOT IN ('running', 'permanent_failure')
                 ) OR (? AND sync_jobs.status = 'permanent_failure')
                 ORDER BY games.appid
                 """,
-                (cutoff, include_failed),
+                (reason, cutoff, reason, reason, include_failed),
             ).fetchall()
             for row in rows:
                 self.enqueue_job("collect", row["item_key"], resume=False, updated_at=timestamp)
@@ -1142,21 +1168,22 @@ class Database:
             (self.max_attempts,),
         ).fetchone()[0]
 
-    def game_progress_details(self, appid: int) -> tuple[str | None, int]:
+    def game_progress_details(self, appid: int) -> tuple[str | None, int, int]:
         """Return display-safe post-commit details for collection progress."""
         row = self.connection.execute(
             """
-            SELECT games.name, COUNT(reviews.recommendation_id) AS review_count
+            SELECT games.name, COALESCE(games.steam_total_reviews, 0) AS total_reviews,
+                   COUNT(reviews.recommendation_id) AS sample_count
             FROM games
             LEFT JOIN reviews ON reviews.appid = games.appid
             WHERE games.appid = ?
-            GROUP BY games.appid, games.name
+            GROUP BY games.appid, games.name, games.steam_total_reviews
             """,
             (appid,),
         ).fetchone()
         if row is None:
-            return None, 0
-        return row["name"], row["review_count"]
+            return None, 0, 0
+        return row["name"], row["total_reviews"], row["sample_count"]
 
     def has_authoritative_verification(self, appid: int) -> bool:
         """Return whether Steam-owned review data proves prior verification."""

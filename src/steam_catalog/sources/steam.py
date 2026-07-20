@@ -1,6 +1,7 @@
 """Steam Store and review requests with pure response parsers."""
 
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 import re
@@ -16,6 +17,7 @@ APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
 REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 METADATA_CACHE_TTL = timedelta(days=7)
 REVIEWS_CACHE_TTL = timedelta(days=1)
+STORE_REGIONS = (("KZ", "KZT"), ("US", "USD"), ("UA", "UAH"))
 _WHITESPACE = re.compile(r"\s+")
 _STRUCTURAL_BREAK = object()
 _BLOCK_TAGS = frozenset(
@@ -63,14 +65,31 @@ class SteamClient:
         yield from parse_app_list(payload)
 
     def fetch_app_details(self, appid: int) -> GameDetails | None:
-        """Fetch details, returning ``None`` for an unavailable application."""
-        payload = self.http.get_json(
+        """Fetch KZ metadata and KZ, US, and UA storefront prices."""
+        kz_payload = self.http.get_json(
             APP_DETAILS_URL,
-            params={"appids": str(appid)},
+            params={"appids": str(appid), "cc": "KZ"},
             cache_ttl=METADATA_CACHE_TTL,
             rate_bucket="steam",
         )
-        return parse_app_details(appid, payload)
+        details = parse_app_details(appid, kz_payload)
+        if details is None:
+            return None
+
+        prices: dict[str, object | None] = {}
+        for country, currency in STORE_REGIONS:
+            payload = (
+                kz_payload
+                if country == "KZ"
+                else self.http.get_json(
+                    APP_DETAILS_URL,
+                    params={"appids": str(appid), "cc": country},
+                    cache_ttl=METADATA_CACHE_TTL,
+                    rate_bucket="steam",
+                )
+            )
+            prices[currency] = _parse_store_price(appid, payload, currency)
+        return replace(details, prices_json=_compact_json(prices))
 
     def fetch_reviews(self, appid: int, filter: str, review_type: str, limit: int) -> ReviewPage:
         """Fetch one aggregate and sample review page."""
@@ -203,8 +222,33 @@ def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | N
         genres_json=_json_or_none(data.get("genres")),
         header_image_url=_optional_string(data.get("header_image")),
         screenshots_json=_json_or_none(data.get("screenshots")),
-        price_json=_json_or_none(data.get("price_overview")),
     )
+
+
+def _parse_store_price(
+    appid: int, payload: Mapping[str, Any], expected_currency: str
+) -> dict[str, Any] | None:
+    response = payload.get(str(appid))
+    if not isinstance(response, Mapping):
+        raise ValueError("Steam app details response is malformed")
+    if response.get("success") is False:
+        return None
+    data = response.get("data")
+    if response.get("success") is not True or not isinstance(data, Mapping):
+        raise ValueError("Steam app details response is malformed")
+    price = data.get("price_overview")
+    if price is None:
+        if data.get("is_free") is True:
+            return {
+                "currency": expected_currency,
+                "initial": 0,
+                "final": 0,
+                "discount_percent": 0,
+            }
+        return None
+    if not isinstance(price, Mapping) or price.get("currency") != expected_currency:
+        raise ValueError("Steam app details response has unexpected price currency")
+    return dict(price)
 
 
 def parse_review_page(
