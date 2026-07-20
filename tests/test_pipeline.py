@@ -62,7 +62,7 @@ class FakeSteamClient:
 
     def fetch_app_details(self, appid: int) -> GameDetails:
         self.calls.append(("details", appid))
-        return replace(self.details, appid=appid, name=f"Game {appid}")
+        return replace(self.details, appid=appid)
 
 
 @pytest.fixture
@@ -155,12 +155,13 @@ def test_claim_job_is_exclusive_due_and_increments_attempts(tmp_path):
 
 def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
     initialized_db.enqueue_job("collect", "10", updated_at="2026-07-20T00:00:00+00:00")
-    initialized_db.claim_job("collect", now="2026-07-20T00:00:01+00:00")
+    first_lease = initialized_db.claim_job("collect", now="2026-07-20T00:00:01+00:00")
 
     initialized_db.fail_job(
         "collect",
         "10",
         error="x" * 2000,
+        expected_attempt_count=first_lease["attempt_count"],
         next_attempt_at="2026-07-20T00:05:00+00:00",
         max_attempts=2,
         updated_at="2026-07-20T00:00:02+00:00",
@@ -171,12 +172,14 @@ def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
     ).fetchone()
     assert tuple(row) == ("failed", 1000)
     assert initialized_db.claim_job("collect", now="2026-07-20T00:04:59+00:00") is None
-    assert initialized_db.claim_job("collect", now="2026-07-20T00:05:00+00:00") is not None
+    second_lease = initialized_db.claim_job("collect", now="2026-07-20T00:05:00+00:00")
+    assert second_lease is not None
 
     initialized_db.fail_job(
         "collect",
         "10",
         error="still failing",
+        expected_attempt_count=second_lease["attempt_count"],
         next_attempt_at="2026-07-20T00:10:00+00:00",
         max_attempts=2,
         updated_at="2026-07-20T00:05:01+00:00",
@@ -188,9 +191,9 @@ def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
 
 def test_complete_job_records_terminal_state(initialized_db):
     initialized_db.enqueue_job("collect", "10")
-    initialized_db.claim_job("collect")
+    lease = initialized_db.claim_job("collect")
 
-    initialized_db.complete_job("collect", "10")
+    initialized_db.complete_job("collect", "10", expected_attempt_count=lease["attempt_count"])
 
     assert initialized_db.job_status("collect", "10") == "complete"
 
@@ -217,7 +220,8 @@ def test_bootstrap_resumes_at_next_page_and_restart_requeues_work(pipeline_facto
     pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)], [item(11, 20)]])
 
     first = pipeline.bootstrap("steamspy", page_limit=1)
-    db.complete_job("collect", "10")
+    lease = db.claim_job("collect")
+    db.complete_job("collect", "10", expected_attempt_count=lease["attempt_count"])
     resumed = pipeline.bootstrap("steamspy", page_limit=1)
     restarted = pipeline.bootstrap("steamspy", resume=False, page_limit=1)
 
@@ -250,7 +254,7 @@ def test_bootstrap_provisional_skip_preserves_existing_metadata(pipeline_factory
         """
     ).fetchone()
     assert tuple(row) == (
-        "Game 10",
+        "Collected name",
         "Keep this searchable description.",
         42,
         8,
@@ -273,6 +277,38 @@ def test_steam_fallback_queues_candidates_without_provisional_counts(pipeline_fa
 
     assert (stats.discovered, stats.queued) == (1, 1)
     assert db.job_status("collect", "10") == "pending"
+
+
+def test_repeated_steam_fallback_resume_preserves_terminal_game_and_job_states(
+    pipeline_factory,
+):
+    app_list = [
+        DiscoveryItem(appid=10, name="Complete", payload_json='{"appid":10}'),
+        DiscoveryItem(appid=11, name="Permanent", payload_json='{"appid":11}'),
+    ]
+    pipeline, db = pipeline_factory(app_list=app_list)
+    pipeline.bootstrap("steam")
+    complete_lease = db.claim_job("collect")
+    db.record_game_status(10, "eligible")
+    db.complete_job("collect", "10", expected_attempt_count=complete_lease["attempt_count"])
+    permanent_lease = db.claim_job("collect")
+    db.record_game_status(11, "ineligible", skip_reason="unavailable")
+    db.fail_job(
+        "collect",
+        "11",
+        "not available",
+        expected_attempt_count=permanent_lease["attempt_count"],
+        next_attempt_at="2026-07-21T00:00:00+00:00",
+        max_attempts=1,
+    )
+
+    stats = pipeline.bootstrap("steam")
+
+    assert (stats.discovered, stats.queued) == (2, 0)
+    assert db.job_status("collect", "10") == "complete"
+    assert db.game_status(10) == "eligible"
+    assert db.job_status("collect", "11") == "permanent_failure"
+    assert db.game_status(11) == "ineligible"
 
 
 def test_verified_threshold_stops_before_store_details(pipeline_factory):
@@ -301,9 +337,9 @@ def test_skipped_app_persists_store_details_and_steam_aggregate(pipeline_factory
 def test_collect_one_completes_queued_job_with_game(pipeline_factory):
     pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)]])
     pipeline.bootstrap("steamspy", page_limit=1)
-    db.claim_job("collect")
+    lease = db.claim_job("collect")
 
-    result = pipeline.collect_one(10)
+    result = pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
 
     assert result.status == "eligible"
     assert db.game_status(10) == "eligible"
@@ -313,17 +349,22 @@ def test_collect_one_completes_queued_job_with_game(pipeline_factory):
 def test_game_and_job_completion_roll_back_together(pipeline_factory, monkeypatch):
     pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)]])
     pipeline.bootstrap("steamspy", page_limit=1)
-    db.claim_job("collect")
+    lease = db.claim_job("collect")
     complete_job = db.complete_job
 
-    def abort_after_completion(job_kind, item_key, *, updated_at=None):
-        complete_job(job_kind, item_key, updated_at=updated_at)
+    def abort_after_completion(job_kind, item_key, *, expected_attempt_count, updated_at=None):
+        complete_job(
+            job_kind,
+            item_key,
+            expected_attempt_count=expected_attempt_count,
+            updated_at=updated_at,
+        )
         raise RuntimeError("abort game transaction")
 
     monkeypatch.setattr(db, "complete_job", abort_after_completion)
 
     with pytest.raises(RuntimeError, match="abort game transaction"):
-        pipeline.collect_one(10)
+        pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
 
     assert db.game_status(10) == "pending"
     assert db.job_status("collect", "10") == "running"
@@ -372,3 +413,168 @@ def test_claim_job_compares_equivalent_utc_timestamp_formats(initialized_db):
     claimed = initialized_db.claim_job("collect", now="2026-07-20T00:00:00+00:00")
 
     assert claimed is not None
+
+
+def test_stale_worker_cannot_complete_or_fail_a_reclaimed_lease(initialized_db):
+    initialized_db.record_game_status(10, "pending")
+    initialized_db.enqueue_job("collect", "10")
+    stale_lease = initialized_db.claim_job("collect")
+    initialized_db.connection.execute(
+        "UPDATE sync_jobs SET status = 'pending' WHERE item_key = '10'"
+    )
+    current_lease = initialized_db.claim_job("collect")
+
+    with pytest.raises(RuntimeError, match="lease"):
+        initialized_db.complete_job(
+            "collect", "10", expected_attempt_count=stale_lease["attempt_count"]
+        )
+    with pytest.raises(RuntimeError, match="lease"):
+        with initialized_db.transaction():
+            initialized_db.record_game_status(10, "eligible")
+            initialized_db.fail_job(
+                "collect",
+                "10",
+                "stale worker",
+                expected_attempt_count=stale_lease["attempt_count"],
+                next_attempt_at="2026-07-21T00:00:00+00:00",
+                max_attempts=3,
+            )
+
+    row = initialized_db.connection.execute(
+        "SELECT status, attempt_count FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", current_lease["attempt_count"])
+    assert initialized_db.game_status(10) == "pending"
+
+
+def test_stale_pipeline_lease_rolls_back_game_writes(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20)]])
+    pipeline.bootstrap("steamspy", page_limit=1)
+    stale_lease = db.claim_job("collect")
+    db.connection.execute("UPDATE sync_jobs SET status = 'pending' WHERE item_key = '10'")
+    current_lease = db.claim_job("collect")
+
+    with pytest.raises(RuntimeError, match="lease"):
+        pipeline.collect_one(10, lease_attempt_count=stale_lease["attempt_count"])
+
+    assert db.game_status(10) == "pending"
+    row = db.connection.execute(
+        "SELECT status, attempt_count FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", current_lease["attempt_count"])
+
+
+def test_repeated_stale_recovery_exhausts_crashed_job(tmp_path):
+    path = tmp_path / "crashes.sqlite3"
+    database = Database(path, max_attempts=2)
+    database.initialize()
+    database.enqueue_job("collect", "10")
+    first_lease = database.claim_job("collect")
+    assert first_lease["attempt_count"] == 1
+    database.connection.execute("UPDATE sync_jobs SET updated_at = '2000-01-01T00:00:00+00:00'")
+    database.close()
+
+    recovered = Database(path, max_attempts=2)
+    recovered.initialize()
+    second_lease = recovered.claim_job("collect")
+    assert second_lease["attempt_count"] == 2
+    recovered.connection.execute("UPDATE sync_jobs SET updated_at = '2000-01-01T00:00:00+00:00'")
+    recovered.close()
+
+    exhausted = Database(path, max_attempts=2)
+    try:
+        exhausted.initialize()
+        assert exhausted.job_status("collect", "10") == "permanent_failure"
+        assert exhausted.claim_job("collect") is None
+    finally:
+        exhausted.close()
+
+
+def test_claim_marks_exhausted_pending_job_permanent(initialized_db):
+    initialized_db.enqueue_job("collect", "10")
+    initialized_db.connection.execute(
+        "UPDATE sync_jobs SET attempt_count = 3 WHERE item_key = '10'"
+    )
+
+    assert initialized_db.claim_job("collect") is None
+    assert initialized_db.job_status("collect", "10") == "permanent_failure"
+
+
+def test_discovery_details_refresh_round_trip_preserves_field_ownership(pipeline_factory):
+    discovered = DiscoveryItem(
+        appid=10,
+        name="Discovery name",
+        steamspy_positive=30,
+        steamspy_negative=5,
+        provisional_reviews=35,
+        payload_json='{"appid":10,"positive":30,"negative":5}',
+    )
+    pipeline, db = pipeline_factory(steamspy_pages=[[discovered]], review_total=40)
+    pipeline.steam.details = replace(
+        pipeline.steam.details,
+        name="Store name",
+        detailed_description_text="Store-owned description.",
+    )
+    pipeline.bootstrap("steamspy", page_limit=1)
+    lease = db.claim_job("collect")
+    pipeline.collect_one(10, lease_attempt_count=lease["attempt_count"])
+
+    collected = db.connection.execute(
+        "SELECT name, steamspy_positive, steamspy_negative FROM games WHERE appid = 10"
+    ).fetchone()
+    assert tuple(collected) == ("Store name", 30, 5)
+
+    pipeline.steamspy.pages = [
+        [
+            replace(
+                discovered,
+                name="New discovery name",
+                steamspy_positive=45,
+                steamspy_negative=6,
+                provisional_reviews=51,
+            )
+        ]
+    ]
+    pipeline.bootstrap("steamspy", resume=False, page_limit=1)
+
+    refreshed = db.connection.execute(
+        """
+        SELECT name, detailed_description_text, steamspy_positive, steamspy_negative,
+               steam_total_reviews
+        FROM games WHERE appid = 10
+        """
+    ).fetchone()
+    assert tuple(refreshed) == ("Store name", "Store-owned description.", 45, 6, 40)
+
+
+def test_claim_prioritizes_review_count_then_timezone_safe_age_and_item_key(initialized_db):
+    jobs = [
+        ("10", 100, None, None, "2026-07-20T03:00:00Z"),
+        ("20", None, 70, 10, "2026-07-20T02:00:00Z"),
+        ("30", None, 45, 5, "2026-07-20T02:00:00+02:00"),
+        ("40", None, 45, 5, "2026-07-20T00:30:00Z"),
+        ("50", None, 45, 5, "2026-07-20T00:30:00+00:00"),
+    ]
+    for item_key, steam_total, spy_positive, spy_negative, updated_at in jobs:
+        initialized_db.upsert_game(
+            appid=int(item_key),
+            name=item_key,
+            eligibility_status="pending",
+            updated_at=updated_at,
+            steam_total_reviews=steam_total,
+            steamspy_positive=spy_positive,
+            steamspy_negative=spy_negative,
+        )
+        initialized_db.enqueue_job("collect", item_key, updated_at=updated_at)
+
+    claimed_keys = []
+    for _ in jobs:
+        lease = initialized_db.claim_job("collect", now="2026-07-21T00:00:00Z")
+        claimed_keys.append(lease["item_key"])
+        initialized_db.complete_job(
+            "collect",
+            lease["item_key"],
+            expected_attempt_count=lease["attempt_count"],
+        )
+
+    assert claimed_keys == ["10", "20", "30", "40", "50"]

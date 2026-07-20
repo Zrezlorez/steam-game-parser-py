@@ -10,6 +10,7 @@ from steam_catalog.models import DiscoveryItem, EligibilityStatus
 
 
 SCHEMA_VERSION = 1
+DEFAULT_MAX_ATTEMPTS = 3
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS games (
@@ -156,8 +157,11 @@ CREATE INDEX IF NOT EXISTS http_cache_expires_at_idx ON http_cache(expires_at);
 class Database:
     """Connection wrapper that owns schema initialization and atomic writes."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS):
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.path = path.resolve()
+        self.max_attempts = max_attempts
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
@@ -324,8 +328,12 @@ class Database:
                     header_image_url = excluded.header_image_url,
                     screenshots_json = excluded.screenshots_json,
                     price_json = excluded.price_json,
-                    steamspy_positive = excluded.steamspy_positive,
-                    steamspy_negative = excluded.steamspy_negative,
+                    steamspy_positive = COALESCE(
+                        excluded.steamspy_positive, games.steamspy_positive
+                    ),
+                    steamspy_negative = COALESCE(
+                        excluded.steamspy_negative, games.steamspy_negative
+                    ),
                     steam_total_positive = excluded.steam_total_positive,
                     steam_total_negative = excluded.steam_total_negative,
                     steam_total_reviews = excluded.steam_total_reviews,
@@ -512,7 +520,7 @@ class Database:
                     steamspy_negative=item.steamspy_negative,
                 )
             else:
-                name = item.name or existing["name"]
+                name = existing["name"] or item.name
                 self._delete_game_search_row(item.appid)
                 self.connection.execute(
                     """
@@ -590,23 +598,44 @@ class Database:
             )
 
     def claim_job(self, job_kind: str, *, now: str | None = None) -> sqlite3.Row | None:
-        """Atomically claim the oldest due job and increment its attempt count."""
+        """Atomically claim the highest-priority due job within the attempt limit."""
         timestamp = now or _utc_now()
         with self.transaction():
-            candidate = self.connection.execute(
+            self.connection.execute(
                 """
-                SELECT item_key
-                FROM sync_jobs
+                UPDATE sync_jobs
+                SET status = 'permanent_failure', next_attempt_at = NULL, updated_at = ?
                 WHERE job_kind = ?
                   AND status IN ('pending', 'failed')
+                  AND attempt_count >= ?
+                """,
+                (timestamp, job_kind, self.max_attempts),
+            )
+            candidate = self.connection.execute(
+                """
+                SELECT jobs.item_key
+                FROM sync_jobs AS jobs
+                LEFT JOIN games
+                  ON jobs.job_kind = 'collect'
+                 AND CAST(games.appid AS TEXT) = jobs.item_key
+                WHERE jobs.job_kind = ?
+                  AND jobs.status IN ('pending', 'failed')
+                  AND jobs.attempt_count < ?
                   AND (
-                      next_attempt_at IS NULL
-                      OR julianday(next_attempt_at) <= julianday(?)
+                      jobs.next_attempt_at IS NULL
+                      OR julianday(jobs.next_attempt_at) <= julianday(?)
                   )
-                ORDER BY updated_at, item_key
+                ORDER BY
+                    COALESCE(
+                        games.steam_total_reviews,
+                        games.steamspy_positive + games.steamspy_negative,
+                        0
+                    ) DESC,
+                    julianday(jobs.updated_at),
+                    jobs.item_key
                 LIMIT 1
                 """,
-                (job_kind, timestamp),
+                (job_kind, self.max_attempts, timestamp),
             ).fetchone()
             if candidate is None:
                 return None
@@ -629,19 +658,28 @@ class Database:
         job_kind: str,
         item_key: str,
         *,
+        expected_attempt_count: int,
         updated_at: str | None = None,
     ) -> None:
-        """Record successful terminal completion for a job."""
+        """Complete a running job only when the caller still owns its lease."""
         with self.transaction():
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE sync_jobs
                 SET status = 'complete', next_attempt_at = NULL, last_error = NULL,
                     updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
+                  AND status = 'running' AND attempt_count = ?
                 """,
-                (updated_at or _utc_now(), job_kind, item_key),
+                (
+                    updated_at or _utc_now(),
+                    job_kind,
+                    item_key,
+                    expected_attempt_count,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Lost job lease: {job_kind}/{item_key}")
 
     def fail_job(
         self,
@@ -649,6 +687,7 @@ class Database:
         item_key: str,
         error: BaseException | str,
         *,
+        expected_attempt_count: int,
         next_attempt_at: str,
         max_attempts: int,
         updated_at: str | None = None,
@@ -657,21 +696,13 @@ class Database:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         with self.transaction():
-            row = self.connection.execute(
-                """
-                SELECT attempt_count FROM sync_jobs
-                WHERE job_kind = ? AND item_key = ?
-                """,
-                (job_kind, item_key),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown job: {job_kind}/{item_key}")
-            permanent = row["attempt_count"] >= max_attempts
-            self.connection.execute(
+            permanent = expected_attempt_count >= max_attempts
+            cursor = self.connection.execute(
                 """
                 UPDATE sync_jobs
                 SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
+                  AND status = 'running' AND attempt_count = ?
                 """,
                 (
                     "permanent_failure" if permanent else "failed",
@@ -680,8 +711,11 @@ class Database:
                     updated_at or _utc_now(),
                     job_kind,
                     item_key,
+                    expected_attempt_count,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Lost job lease: {job_kind}/{item_key}")
 
     def record_game_status(
         self,
@@ -823,10 +857,15 @@ class Database:
         self.connection.execute(
             """
             UPDATE sync_jobs
-            SET status = 'pending', next_attempt_at = NULL, updated_at = ?
+            SET status = CASE
+                    WHEN attempt_count >= ? THEN 'permanent_failure'
+                    ELSE 'pending'
+                END,
+                next_attempt_at = NULL,
+                updated_at = ?
             WHERE status = 'running' AND julianday(updated_at) < julianday(?)
             """,
-            (now.isoformat(), cutoff),
+            (self.max_attempts, now.isoformat(), cutoff),
         )
 
 
