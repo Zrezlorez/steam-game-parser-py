@@ -12,23 +12,30 @@ Run this exact PowerShell sequence from the directory that contains `steam_catal
 cd steam_catalog
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-steam-catalog init
-steam-catalog import-library ..\data\steam_info.json
-steam-catalog bootstrap --source steamspy --resume
-steam-catalog collect --limit 10
-steam-catalog status
+python -m pip install -e .
+steam-catalog run --library ..\data\steam_info.json
 ```
+
+The first `run` initializes SQLite, imports the library, discovers games through SteamSpy, and
+consumes all collection jobs available now. Later incremental updates need only:
+
+```powershell
+steam-catalog run
+```
+
+Each game is printed after its result is committed to SQLite. Pressing Ctrl+C exits with status
+130 and leaves the catalog resumable with the same command. Network failures are scheduled for a
+later retry; `run` stops when no job is claimable now instead of waiting for retry delays.
 
 The global `--database` option selects another SQLite file. It must appear before the command:
 
 ```powershell
-steam-catalog --database .\data\alternate.sqlite3 init
+steam-catalog --database .\data\alternate.sqlite3 run
 python -m steam_catalog --database .\data\alternate.sqlite3 status
 ```
 
-Every data command initializes the schema when needed. Interrupted bootstrap and collection runs
-report durable progress and can be resumed with the same command.
+Every data command initializes the schema when needed. The individual commands below remain
+available when bounded runs or manual control are useful.
 
 ## Collection Workflow
 
