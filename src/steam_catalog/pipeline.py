@@ -199,7 +199,7 @@ class CatalogPipeline:
         """Verify eligibility first, then persist one app's store metadata."""
         if lease_token is None and self.database.job_status("collect", str(appid)):
             raise ValueError("lease_token is required for a queued collect job")
-        summary = self.steam.fetch_reviews(appid, "recent", "all", 1)
+        summary = self.steam.fetch_reviews(appid, "recent", "all", 100)
         timestamp = _utc_now()
         aggregate = {
             "steam_total_positive": summary.total_positive,
@@ -245,14 +245,18 @@ class CatalogPipeline:
     def collect_review_samples(
         self, appid: int, summary: ReviewPage
     ) -> dict[SampleKind, list[Review]]:
-        """Collect broad helpful/recent pages with targeted shortfall fallbacks."""
+        """Collect helpful/recent samples with targeted shortfall fallbacks."""
         samples: dict[SampleKind, list[Review]] = {}
         aggregate_counts = {
             "positive": summary.total_positive,
             "negative": summary.total_negative,
         }
         for sample_prefix, filter_name in (("helpful", "all"), ("recent", "recent")):
-            broad = self.steam.fetch_reviews(appid, filter_name, "all", 100)
+            broad = (
+                summary
+                if sample_prefix == "recent"
+                else self.steam.fetch_reviews(appid, filter_name, "all", 100)
+            )
             for polarity in ("positive", "negative"):
                 target = min(5, aggregate_counts[polarity])
                 selected = select_reviews(broad.reviews, polarity, target)
