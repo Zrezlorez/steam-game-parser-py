@@ -1,0 +1,324 @@
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from steam_catalog.cli import app
+from steam_catalog.db import Database
+from steam_catalog.pipeline import CollectionResult, RunStats
+
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def initialized_database_path(tmp_path: Path) -> Path:
+    path = tmp_path / "catalog.sqlite3"
+    database = Database(path)
+    database.initialize()
+    database.enqueue_job("collect", "10", updated_at="2026-07-20T00:00:00+00:00")
+    database.record_game_status(20, "eligible", updated_at="2026-07-20T00:00:00+00:00")
+    database.close()
+    return path
+
+
+def _open_database(path: Path) -> Database:
+    database = Database(path)
+    database.initialize()
+    return database
+
+
+def test_init_creates_database(tmp_path: Path):
+    database_path = tmp_path / "catalog.sqlite3"
+
+    result = runner.invoke(app, ["--database", str(database_path), "init"])
+
+    assert result.exit_code == 0
+    assert database_path.exists()
+    assert "initialized" in result.stdout.lower()
+
+
+def test_help_lists_exact_command_surface():
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    for command in (
+        "init",
+        "bootstrap",
+        "collect",
+        "refresh",
+        "import-library",
+        "status",
+        "export",
+    ):
+        assert command in result.stdout
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["collect", "--limit", "0"],
+        ["collect", "--appid", "0"],
+        ["bootstrap", "--page-limit", "0"],
+        ["refresh", "--older-than-days", "0"],
+    ],
+)
+def test_positive_options_reject_zero(tmp_path: Path, arguments: list[str]):
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), *arguments],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_status_reports_every_required_category(tmp_path: Path):
+    path = tmp_path / "status.sqlite3"
+    database = _open_database(path)
+    statuses = (
+        "eligible",
+        "below_provisional_threshold",
+        "below_verified_threshold",
+        "ineligible",
+    )
+    for appid, status in enumerate(statuses, start=1):
+        database.record_game_status(appid, status, updated_at="2026-07-20T00:00:00+00:00")
+    database.connection.execute(
+        "UPDATE games SET metadata_fetched_at = ? WHERE appid = 1",
+        ("2026-07-20T00:00:00+00:00",),
+    )
+    database.connection.execute(
+        "UPDATE games SET reviews_fetched_at = ? WHERE appid = 1",
+        ("2026-07-20T00:00:00+00:00",),
+    )
+    for offset, status in enumerate(("pending", "running", "failed", "permanent_failure")):
+        database.enqueue_job("collect", str(100 + offset))
+        database.connection.execute(
+            "UPDATE sync_jobs SET status = ? WHERE item_key = ?",
+            (status, str(100 + offset)),
+        )
+    database.close()
+
+    result = runner.invoke(app, ["--database", str(path), "status"])
+
+    assert result.exit_code == 0
+    for label in (
+        "eligible",
+        "provisional-below-threshold",
+        "verified-below-threshold",
+        "skipped",
+        "metadata-complete",
+        "review-complete",
+        "pending",
+        "running",
+        "retrying",
+        "permanent-failure",
+    ):
+        assert f"{label}: 1" in result.stdout.lower()
+
+
+def test_status_initializes_missing_database(tmp_path: Path):
+    path = tmp_path / "new.sqlite3"
+
+    result = runner.invoke(app, ["--database", str(path), "status"])
+
+    assert result.exit_code == 0
+    assert "eligible: 0" in result.stdout.lower()
+
+
+def test_refresh_schedules_only_old_rows_and_optionally_permanent_failures(tmp_path: Path):
+    path = tmp_path / "refresh.sqlite3"
+    database = _open_database(path)
+    database.record_game_status(10, "eligible", updated_at="2000-01-01T00:00:00+00:00")
+    database.record_game_status(11, "eligible", updated_at="2999-01-01T00:00:00+00:00")
+    database.record_game_status(12, "ineligible", updated_at="2999-01-01T00:00:00+00:00")
+    database.enqueue_job("collect", "12")
+    database.connection.execute(
+        "UPDATE sync_jobs SET status = 'permanent_failure' WHERE item_key = '12'"
+    )
+    database.close()
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "refresh", "--older-than-days", "30"],
+    )
+
+    assert result.exit_code == 0
+    database = _open_database(path)
+    assert database.job_status("collect", "10") == "pending"
+    assert database.job_status("collect", "11") is None
+    assert database.job_status("collect", "12") == "permanent_failure"
+    database.close()
+
+    failed_result = runner.invoke(
+        app,
+        ["--database", str(path), "refresh", "--older-than-days", "30", "--failed"],
+    )
+
+    assert failed_result.exit_code == 0
+    database = _open_database(path)
+    assert database.job_status("collect", "12") == "pending"
+    database.close()
+
+
+def test_import_library_reports_concise_data_error(tmp_path: Path):
+    path = tmp_path / "bad.json"
+    path.write_text("not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "--database",
+            str(tmp_path / "catalog.sqlite3"),
+            "import-library",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "invalid library json" in result.stdout.lower()
+    assert "traceback" not in result.stdout.lower()
+
+
+def test_invalid_environment_setting_reports_concise_error(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STEAM_CATALOG_MAX_ATTEMPTS", "0")
+
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "status"],
+    )
+
+    assert result.exit_code == 1
+    assert "error: max_attempts must be positive" in result.stdout.lower()
+    assert "traceback" not in result.stdout.lower()
+
+
+def test_import_library_and_export_are_wired_offline(tmp_path: Path):
+    library = tmp_path / "library.json"
+    library.write_text('[{"appid":10,"name":"Owned","playtime_forever":5}]', encoding="utf-8")
+    database_path = tmp_path / "catalog.sqlite3"
+
+    imported = runner.invoke(
+        app,
+        ["--database", str(database_path), "import-library", str(library)],
+    )
+    output = tmp_path / "catalog.jsonl"
+    exported = runner.invoke(
+        app,
+        ["--database", str(database_path), "export", str(output), "--format", "jsonl"],
+    )
+
+    assert imported.exit_code == 0
+    assert "imported: 1" in imported.stdout.lower()
+    assert exported.exit_code == 0
+    assert "exported: 0" in exported.stdout.lower()
+    assert output.read_text(encoding="utf-8") == ""
+
+
+def test_bootstrap_delegates_without_printing_payloads(tmp_path: Path, monkeypatch):
+    class FakePipeline:
+        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            assert (source, resume, page_limit) == ("steamspy", True, 2)
+            return RunStats(discovered=3, queued=2)
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield FakePipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        [
+            "--database",
+            str(tmp_path / "catalog.sqlite3"),
+            "bootstrap",
+            "--source",
+            "steamspy",
+            "--resume",
+            "--page-limit",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "discovered: 3" in result.stdout.lower()
+    assert "queued: 2" in result.stdout.lower()
+    assert "payload" not in result.stdout.lower()
+
+
+def test_bootstrap_keyboard_interrupt_reports_progress_and_exits_130(tmp_path: Path, monkeypatch):
+    class InterruptingPipeline:
+        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            raise KeyboardInterrupt
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield InterruptingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "bootstrap"],
+    )
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.stdout.lower()
+    assert "discovered: 0" in result.stdout.lower()
+    assert "queued: 0" in result.stdout.lower()
+
+
+def test_collect_keyboard_interrupt_releases_job_and_exits_130(tmp_path: Path, monkeypatch):
+    path = tmp_path / "interrupt.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+
+    class InterruptingPipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            raise KeyboardInterrupt
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield InterruptingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "collect", "--limit", "1", "--resume"],
+    )
+
+    assert result.exit_code == 130
+    assert "completed: 0" in result.stdout.lower()
+    assert "interrupted" in result.stdout.lower()
+    database = _open_database(path)
+    row = database.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("pending", 0, None)
+    database.close()
+
+
+def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch):
+    class FakePipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            assert (appid, lease_token) == (4000, None)
+            return CollectionResult(appid=appid, status="eligible")
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield FakePipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "collect", "--appid", "4000"],
+    )
+
+    assert result.exit_code == 0
+    assert "eligible: 1" in result.stdout.lower()
+    assert "review" not in result.stdout.lower()

@@ -713,6 +713,35 @@ class Database:
                 (job_kind, item_key),
             )
 
+    def schedule_refresh(
+        self,
+        cutoff: str,
+        *,
+        include_failed: bool = False,
+        updated_at: str | None = None,
+    ) -> int:
+        """Queue stale games and, when requested, permanently failed collect jobs."""
+        timestamp = updated_at or _utc_now()
+        with self.transaction():
+            rows = self.connection.execute(
+                """
+                SELECT CAST(games.appid AS TEXT) AS item_key
+                FROM games
+                LEFT JOIN sync_jobs
+                  ON sync_jobs.job_kind = 'collect'
+                 AND sync_jobs.item_key = CAST(games.appid AS TEXT)
+                WHERE (
+                        julianday(games.updated_at) < julianday(?)
+                    AND COALESCE(sync_jobs.status, '') NOT IN ('running', 'permanent_failure')
+                ) OR (? AND sync_jobs.status = 'permanent_failure')
+                ORDER BY games.appid
+                """,
+                (cutoff, include_failed),
+            ).fetchall()
+            for row in rows:
+                self.enqueue_job("collect", row["item_key"], resume=False, updated_at=timestamp)
+        return len(rows)
+
     def claim_job(self, job_kind: str, *, now: str | None = None) -> sqlite3.Row | None:
         """Atomically claim the highest-priority due job within the attempt limit."""
         timestamp = now or _utc_now()
@@ -770,6 +799,34 @@ class Database:
                 "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
                 (job_kind, candidate["item_key"]),
             ).fetchone()
+
+    def release_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        *,
+        expected_lease_token: str,
+        updated_at: str | None = None,
+    ) -> None:
+        """Return interrupted work to the pending queue without consuming an attempt."""
+        with self.transaction():
+            cursor = self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'pending', attempt_count = MAX(0, attempt_count - 1),
+                    lease_token = NULL, next_attempt_at = NULL, updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                  AND status = 'running' AND lease_token = ?
+                """,
+                (
+                    updated_at or _utc_now(),
+                    job_kind,
+                    item_key,
+                    expected_lease_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Lost job lease: {job_kind}/{item_key}")
 
     def complete_job(
         self,
@@ -928,6 +985,39 @@ class Database:
         return self.connection.execute(
             "SELECT COUNT(*) FROM reviews WHERE appid = ?", (appid,)
         ).fetchone()[0]
+
+    def status_counts(self) -> dict[str, int]:
+        """Return the stable user-facing catalog and collection status categories."""
+        game_categories = {
+            "eligible": ("eligibility_status = ?", ("eligible",)),
+            "provisional-below-threshold": (
+                "eligibility_status = ?",
+                ("below_provisional_threshold",),
+            ),
+            "verified-below-threshold": (
+                "eligibility_status = ?",
+                ("below_verified_threshold",),
+            ),
+            "skipped": ("eligibility_status = ?", ("ineligible",)),
+            "metadata-complete": ("metadata_fetched_at IS NOT NULL", ()),
+            "review-complete": ("reviews_fetched_at IS NOT NULL", ()),
+        }
+        counts = {
+            label: self.connection.execute(
+                f"SELECT COUNT(*) FROM games WHERE {predicate}", parameters
+            ).fetchone()[0]
+            for label, (predicate, parameters) in game_categories.items()
+        }
+        for label, status in {
+            "pending": "pending",
+            "running": "running",
+            "retrying": "failed",
+            "permanent-failure": "permanent_failure",
+        }.items():
+            counts[label] = self.connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE status = ?", (status,)
+            ).fetchone()[0]
+        return counts
 
     def search_games(self, query: str, limit: int) -> list[dict[str, object]]:
         """Return BM25-ranked game matches with source-backed highlighted snippets."""
