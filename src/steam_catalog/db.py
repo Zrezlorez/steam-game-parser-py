@@ -439,6 +439,53 @@ class Database:
                 (rowid, appid, recommendation_id, review_text),
             )
 
+    def get_http_cache(self, cache_key: str) -> sqlite3.Row | None:
+        """Return the cached response for a canonical request key, if present."""
+        return self.connection.execute(
+            "SELECT * FROM http_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+
+    def upsert_http_cache(
+        self,
+        *,
+        cache_key: str,
+        url: str,
+        status_code: int,
+        response_body: str,
+        etag: str | None,
+        last_modified: str | None,
+        fetched_at: str,
+        expires_at: str,
+    ) -> None:
+        """Store a UTF-8 HTTP response and its freshness metadata."""
+        with self.transaction():
+            self.connection.execute(
+                """
+                INSERT INTO http_cache(
+                    cache_key, url, status_code, response_body, etag, last_modified,
+                    fetched_at, expires_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    url = excluded.url,
+                    status_code = excluded.status_code,
+                    response_body = excluded.response_body,
+                    etag = excluded.etag,
+                    last_modified = excluded.last_modified,
+                    fetched_at = excluded.fetched_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    cache_key,
+                    url,
+                    status_code,
+                    response_body,
+                    etag,
+                    last_modified,
+                    fetched_at,
+                    expires_at,
+                ),
+            )
+
     def _delete_game_search_row(self, appid: int) -> None:
         self.connection.execute(
             """
