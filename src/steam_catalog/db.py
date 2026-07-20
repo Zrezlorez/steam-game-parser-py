@@ -463,6 +463,57 @@ class Database:
                 (rowid, appid, recommendation_id, review_text),
             )
 
+    def upsert_library_entry(
+        self,
+        *,
+        appid: int,
+        name_at_import: str,
+        playtime_forever_minutes: int,
+        playtime_2weeks_minutes: int | None,
+        last_played_at: str | None,
+        platform_playtime_json: str | None,
+        source_payload_json: str,
+        imported_at: str,
+    ) -> bool:
+        """Upsert one personal library row without replacing catalog-owned game metadata."""
+        with self.transaction():
+            inserted = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO games(appid, name, eligibility_status, updated_at)
+                VALUES(?, ?, 'pending', ?)
+                """,
+                (appid, name_at_import, imported_at),
+            )
+            if inserted.rowcount > 0:
+                self._insert_game_search_row(appid)
+            self.connection.execute(
+                """
+                INSERT INTO user_library(
+                    appid, name_at_import, playtime_forever_minutes, playtime_2weeks_minutes,
+                    last_played_at, platform_playtime_json, source_payload_json, imported_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(appid) DO UPDATE SET
+                    name_at_import = excluded.name_at_import,
+                    playtime_forever_minutes = excluded.playtime_forever_minutes,
+                    playtime_2weeks_minutes = excluded.playtime_2weeks_minutes,
+                    last_played_at = excluded.last_played_at,
+                    platform_playtime_json = excluded.platform_playtime_json,
+                    source_payload_json = excluded.source_payload_json,
+                    imported_at = excluded.imported_at
+                """,
+                (
+                    appid,
+                    name_at_import,
+                    playtime_forever_minutes,
+                    playtime_2weeks_minutes,
+                    last_played_at,
+                    platform_playtime_json,
+                    source_payload_json,
+                    imported_at,
+                ),
+            )
+        return inserted.rowcount > 0
+
     def replace_review_samples(
         self,
         appid: int,
