@@ -55,16 +55,21 @@ class CachedHttpClient:
         params: Mapping[str, str] | None = None,
         cache_ttl: timedelta | None = None,
         rate_bucket: str | None = None,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         """Return a cached or fetched JSON object for a GET request."""
         normalized_url, cache_key = self._normalized_url_and_key(url, params)
         ttl = cache_ttl if cache_ttl is not None else timedelta(hours=self.settings.cache_ttl_hours)
         cached = self.database.get_http_cache(cache_key)
         now = self._now()
-        if cached is not None and self._parse_datetime(cached["expires_at"]) > now:
+        if (
+            not force_refresh
+            and cached is not None
+            and self._parse_datetime(cached["expires_at"]) > now
+        ):
             return self._decode_json(cached["response_body"])
 
-        headers = self._conditional_headers(cached)
+        headers = self._conditional_headers(cached) if not force_refresh else {}
         response = self._request_with_retries(normalized_url, headers, rate_bucket)
 
         if response.status_code == httpx.codes.NOT_MODIFIED and cached is not None:

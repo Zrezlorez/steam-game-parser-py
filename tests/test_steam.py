@@ -84,14 +84,14 @@ def test_parse_app_details_returns_none_for_missing_app_and_rejects_malformed_re
         parse_app_details(10, {"10": {"success": True, "data": {}}})
 
 
-def test_fetch_app_details_uses_kz_metadata_and_collects_three_currency_prices(load_fixture):
+def test_fetch_app_details_uses_only_kz_metadata_and_price(load_fixture):
     fixture = load_fixture("steam_appdetails.json")
 
     class RegionalHttpClient:
         def __init__(self):
             self.countries = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
             self.countries.append(params["cc"])
             payload = deepcopy(fixture)
             currency = {"KZ": "KZT", "US": "USD", "UA": "UAH"}[params["cc"]]
@@ -104,11 +104,9 @@ def test_fetch_app_details_uses_kz_metadata_and_collects_three_currency_prices(l
 
     assert details is not None
     assert details.name == "Drill Builder"
-    assert http.countries == ["KZ", "US", "UA"]
+    assert http.countries == ["KZ"]
     assert json.loads(details.prices_json) == {
         "KZT": {"currency": "KZT", "initial": 999, "final": 499},
-        "USD": {"currency": "USD", "initial": 999, "final": 499},
-        "UAH": {"currency": "UAH", "initial": 999, "final": 499},
     }
 
 
@@ -131,7 +129,7 @@ def test_fetch_app_details_keeps_missing_region_and_free_price_explicit(load_fix
     fixture = load_fixture("steam_appdetails.json")
 
     class MixedHttpClient:
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
             if params["cc"] == "US":
                 return {"10": {"success": False}}
             payload = deepcopy(fixture)
@@ -140,11 +138,14 @@ def test_fetch_app_details_keeps_missing_region_and_free_price_explicit(load_fix
                 payload["10"]["data"]["is_free"] = True
             return payload
 
-    details = SteamClient(MixedHttpClient()).fetch_app_details(10)
+    client = SteamClient(MixedHttpClient())
+    details = client.fetch_app_details(10)
 
     assert details is not None
     assert json.loads(details.prices_json) == {
         "KZT": {"currency": "KZT", "initial": 999, "final": 499},
+    }
+    assert json.loads(client.fetch_regional_prices(10)) == {
         "USD": None,
         "UAH": {"currency": "UAH", "initial": 0, "final": 0, "discount_percent": 0},
     }
@@ -239,7 +240,7 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
         def __init__(self):
             self.calls: list[tuple[str, dict[str, str], timedelta, str]] = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
             self.calls.append((url, dict(params), cache_ttl, rate_bucket))
             if "appdetails" in url:
                 payload = deepcopy(load_fixture("steam_appdetails.json"))
@@ -258,6 +259,10 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
 
     assert [item.appid for item in client.fetch_app_list()] == [10]
     assert client.fetch_app_details(10) is not None
+    assert json.loads(client.fetch_regional_prices(10)) == {
+        "USD": {"currency": "USD", "initial": 999, "final": 499},
+        "UAH": {"currency": "UAH", "initial": 999, "final": 499},
+    }
     assert client.fetch_reviews(10, "recent", "positive", 5).total_reviews == 20
     assert http.calls == [
         (

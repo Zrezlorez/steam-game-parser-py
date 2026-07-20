@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import secrets
 import sqlite3
@@ -12,7 +13,7 @@ import unicodedata
 from steam_catalog.models import DiscoveryItem, EligibilityStatus, Review
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 3
 _SNIPPET_CONTEXT = 80
 
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS games (
     header_image_url TEXT,
     screenshots_json TEXT,
     prices_json TEXT,
+    regional_prices_fetched_at TEXT,
     steamspy_positive INTEGER,
     steamspy_negative INTEGER,
     steam_total_positive INTEGER,
@@ -172,6 +174,11 @@ ALTER TABLE games ADD COLUMN prices_json TEXT;
 UPDATE schema_version SET version = 2;
 """
 
+MIGRATION_3 = """
+ALTER TABLE games ADD COLUMN regional_prices_fetched_at TEXT;
+UPDATE schema_version SET version = 3;
+"""
+
 
 class Database:
     """Connection wrapper that owns schema initialization and atomic writes."""
@@ -211,7 +218,11 @@ class Database:
             version = version_row["version"]
             if version == 1:
                 self.connection.executescript(MIGRATION_2)
-            elif version != SCHEMA_VERSION:
+                version = 2
+            if version == 2:
+                self.connection.executescript(MIGRATION_3)
+                version = 3
+            if version != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported SQLite schema version: {version}")
 
         self._ensure_sync_job_lease_token()
@@ -347,6 +358,7 @@ class Database:
             header_image_url,
             screenshots_json,
             prices_json,
+            None,
             steamspy_positive,
             steamspy_negative,
             steam_total_positive,
@@ -371,13 +383,14 @@ class Database:
                     about_the_game_html, about_the_game_text, developers_json,
                     publishers_json, languages_json, platforms_json, categories_json,
                     genres_json, header_image_url, screenshots_json, prices_json,
+                    regional_prices_fetched_at,
                     steamspy_positive, steamspy_negative, steam_total_positive,
                     steam_total_negative, steam_total_reviews, review_score,
                     review_score_desc, eligibility_status, skip_reason,
                     metadata_fetched_at, reviews_fetched_at, updated_at
                 ) VALUES(
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(appid) DO UPDATE SET
                     name = excluded.name,
@@ -400,6 +413,7 @@ class Database:
                     header_image_url = excluded.header_image_url,
                     screenshots_json = excluded.screenshots_json,
                     prices_json = excluded.prices_json,
+                    regional_prices_fetched_at = NULL,
                     steamspy_positive = COALESCE(
                         excluded.steamspy_positive, games.steamspy_positive
                     ),
@@ -808,6 +822,35 @@ class Database:
                 self.enqueue_job("collect", row["item_key"], resume=False, updated_at=timestamp)
         return len(rows)
 
+    def schedule_price_collection(self, *, updated_at: str | None = None) -> int:
+        """Queue eligible games whose USD and UAH prices have not been collected."""
+        timestamp = updated_at or _utc_now()
+        with self.transaction():
+            rows = self.connection.execute(
+                """
+                SELECT CAST(games.appid AS TEXT) AS item_key
+                FROM games
+                LEFT JOIN sync_jobs
+                  ON sync_jobs.job_kind = 'collect_prices'
+                 AND sync_jobs.item_key = CAST(games.appid AS TEXT)
+                WHERE games.eligibility_status = 'eligible'
+                  AND games.regional_prices_fetched_at IS NULL
+                  AND COALESCE(sync_jobs.status, '') NOT IN ('running', 'permanent_failure')
+                ORDER BY games.appid
+                """
+            ).fetchall()
+            for row in rows:
+                status = self.job_status("collect_prices", row["item_key"])
+                if status is None:
+                    self.enqueue_job(
+                        "collect_prices", row["item_key"], resume=True, updated_at=timestamp
+                    )
+                elif status == "complete":
+                    self.enqueue_job(
+                        "collect_prices", row["item_key"], resume=False, updated_at=timestamp
+                    )
+        return len(rows)
+
     def claim_job(
         self,
         job_kind: str,
@@ -833,9 +876,7 @@ class Database:
                 """
                 SELECT jobs.item_key
                 FROM sync_jobs AS jobs
-                LEFT JOIN games
-                  ON jobs.job_kind = 'collect'
-                 AND CAST(games.appid AS TEXT) = jobs.item_key
+                LEFT JOIN games ON CAST(games.appid AS TEXT) = jobs.item_key
                 WHERE jobs.job_kind = ?
                   AND jobs.status IN ('pending', 'failed')
                   AND jobs.attempt_count < ?
@@ -1141,6 +1182,50 @@ class Database:
                     (status, skip_reason, timestamp, appid),
                 )
 
+    def update_regional_prices(
+        self,
+        appid: int,
+        regional_prices_json: str,
+        *,
+        fetched_at: str,
+        expected_lease_token: str | None = None,
+    ) -> None:
+        """Merge USD/UAH into the current KZT snapshot and complete its job."""
+        regional_prices = json.loads(regional_prices_json)
+        if not isinstance(regional_prices, dict) or set(regional_prices) != {"USD", "UAH"}:
+            raise ValueError("Regional prices must contain exactly USD and UAH")
+
+        with self.transaction():
+            row = self.connection.execute(
+                "SELECT eligibility_status, prices_json FROM games WHERE appid = ?", (appid,)
+            ).fetchone()
+            if row is None or row["eligibility_status"] != "eligible":
+                raise ValueError(f"appid {appid} is not an eligible game")
+            current_prices = json.loads(row["prices_json"] or "{}")
+            if not isinstance(current_prices, dict) or "KZT" not in current_prices:
+                raise ValueError(f"appid {appid} has no KZT price snapshot")
+            merged_prices = {"KZT": current_prices["KZT"], **regional_prices}
+            self.connection.execute(
+                """
+                UPDATE games
+                SET prices_json = ?, regional_prices_fetched_at = ?, updated_at = ?
+                WHERE appid = ?
+                """,
+                (
+                    json.dumps(merged_prices, ensure_ascii=False, separators=(",", ":")),
+                    fetched_at,
+                    fetched_at,
+                    appid,
+                ),
+            )
+            if expected_lease_token is not None:
+                self.complete_job(
+                    "collect_prices",
+                    str(appid),
+                    expected_lease_token=expected_lease_token,
+                    updated_at=fetched_at,
+                )
+
     def next_source_page(self, source: str) -> int:
         """Return the first SteamSpy page not represented in source items."""
         row = self.connection.execute(
@@ -1155,18 +1240,22 @@ class Database:
         ).fetchone()
         return None if row is None else row["status"]
 
-    def collection_queue_size(self) -> int:
-        """Return collection jobs that remain eligible for a future claim."""
+    def job_queue_size(self, job_kind: str) -> int:
+        """Return jobs of one kind that remain eligible for a future claim."""
         return self.connection.execute(
             """
             SELECT COUNT(*)
             FROM sync_jobs
-            WHERE job_kind = 'collect'
+            WHERE job_kind = ?
               AND status IN ('pending', 'failed')
               AND attempt_count < ?
             """,
-            (self.max_attempts,),
+            (job_kind, self.max_attempts),
         ).fetchone()[0]
+
+    def collection_queue_size(self) -> int:
+        """Return collection jobs that remain eligible for a future claim."""
+        return self.job_queue_size("collect")
 
     def game_progress_details(self, appid: int) -> tuple[str | None, int, int]:
         """Return display-safe post-commit details for collection progress."""

@@ -65,7 +65,7 @@ class SteamClient:
         yield from parse_app_list(payload)
 
     def fetch_app_details(self, appid: int) -> GameDetails | None:
-        """Fetch KZ metadata and KZ, US, and UA storefront prices."""
+        """Fetch KZ metadata and its storefront price."""
         kz_payload = self.http.get_json(
             APP_DETAILS_URL,
             params={"appids": str(appid), "cc": "KZ"},
@@ -75,21 +75,22 @@ class SteamClient:
         details = parse_app_details(appid, kz_payload)
         if details is None:
             return None
+        prices = {"KZT": _parse_store_price(appid, kz_payload, "KZT")}
+        return replace(details, prices_json=_compact_json(prices))
 
+    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str:
+        """Fetch the optional US and UA storefront prices."""
         prices: dict[str, object | None] = {}
-        for country, currency in STORE_REGIONS:
-            payload = (
-                kz_payload
-                if country == "KZ"
-                else self.http.get_json(
-                    APP_DETAILS_URL,
-                    params={"appids": str(appid), "cc": country},
-                    cache_ttl=METADATA_CACHE_TTL,
-                    rate_bucket="steam",
-                )
+        for country, currency in STORE_REGIONS[1:]:
+            payload = self.http.get_json(
+                APP_DETAILS_URL,
+                params={"appids": str(appid), "cc": country},
+                cache_ttl=METADATA_CACHE_TTL,
+                rate_bucket="steam",
+                force_refresh=force_refresh,
             )
             prices[currency] = _parse_store_price(appid, payload, currency)
-        return replace(details, prices_json=_compact_json(prices))
+        return _compact_json(prices)
 
     def fetch_reviews(self, appid: int, filter: str, review_type: str, limit: int) -> ReviewPage:
         """Fetch one aggregate and sample review page."""

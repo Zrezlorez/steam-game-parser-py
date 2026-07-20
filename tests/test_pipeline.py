@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -69,6 +70,15 @@ class FakeSteamClient:
             return None
         return replace(self.details, appid=appid)
 
+    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str:
+        self.calls.append(("prices", appid, force_refresh))
+        return json.dumps(
+            {
+                "USD": {"currency": "USD", "final": 999},
+                "UAH": {"currency": "UAH", "final": 39900},
+            }
+        )
+
 
 @pytest.fixture
 def pipeline_factory(tmp_path):
@@ -131,6 +141,38 @@ def test_non_game_and_unreleased_apps_get_explicit_skip_reasons(pipeline_factory
 
     assert non_game.collect_one(10).skip_reason == "not_a_game"
     assert upcoming.collect_one(10).skip_reason == "unreleased"
+
+
+def test_primary_collection_reuses_recent_page_and_regional_pass_merges_prices(
+    pipeline_factory,
+):
+    pipeline, db = pipeline_factory(review_total=20)
+    pipeline.steam.details = replace(
+        pipeline.steam.details,
+        prices_json='{"KZT":{"currency":"KZT","final":4990}}',
+    )
+
+    pipeline.collect_one(10)
+
+    assert pipeline.steam.calls.count(("reviews", 10, "recent", "all", 100)) == 1
+    assert json.loads(db.connection.execute("SELECT prices_json FROM games").fetchone()[0]) == {
+        "KZT": {"currency": "KZT", "final": 4990}
+    }
+
+    db.enqueue_job("collect_prices", "10")
+    lease = db.claim_job("collect_prices", lease_token="price-lease")
+    pipeline.collect_prices_one(10, lease_token=lease["lease_token"])
+
+    row = db.connection.execute(
+        "SELECT prices_json, regional_prices_fetched_at FROM games WHERE appid = 10"
+    ).fetchone()
+    assert json.loads(row["prices_json"]) == {
+        "KZT": {"currency": "KZT", "final": 4990},
+        "USD": {"currency": "USD", "final": 999},
+        "UAH": {"currency": "UAH", "final": 39900},
+    }
+    assert row["regional_prices_fetched_at"] is not None
+    assert db.job_status("collect_prices", "10") == "complete"
 
 
 def test_claim_job_is_exclusive_due_and_increments_attempts(tmp_path):
@@ -421,7 +463,7 @@ def test_verified_threshold_stops_before_store_details(pipeline_factory):
 
     pipeline.collect_one(10)
 
-    assert pipeline.steam.calls == [("reviews", 10, "recent", "all", 1)]
+    assert pipeline.steam.calls == [("reviews", 10, "recent", "all", 100)]
 
 
 def test_skipped_app_persists_store_details_and_steam_aggregate(pipeline_factory):

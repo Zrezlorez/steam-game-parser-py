@@ -47,6 +47,8 @@ class SteamProvider(Protocol):
 
     def fetch_app_details(self, appid: int) -> GameDetails | None: ...
 
+    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str: ...
+
     def fetch_reviews(
         self, appid: int, filter: str, review_type: str, limit: int
     ) -> ReviewPage: ...
@@ -235,15 +237,42 @@ class CatalogPipeline:
                 appid, details, "unreleased", timestamp, aggregate, lease_token
             )
 
-        samples = self.collect_review_samples(appid, summary)
+        samples = self.collect_review_samples(appid, summary, recent_page=summary)
         with self.database.transaction():
             self._store_details(details, "eligible", None, timestamp, aggregate)
             self.database.replace_review_samples(appid, samples, fetched_at=timestamp)
             self._complete_job(appid, lease_token, timestamp)
         return CollectionResult(appid, "eligible")
 
+    def collect_prices_one(
+        self,
+        appid: int,
+        *,
+        lease_token: str | None = None,
+        force_refresh: bool = False,
+    ) -> CollectionResult:
+        """Fetch and atomically persist USD and UAH for one eligible game."""
+        if lease_token is None and self.database.job_status("collect_prices", str(appid)):
+            raise ValueError("lease_token is required for a queued collect_prices job")
+        if self.database.game_status(appid) != "eligible":
+            raise ValueError(f"appid {appid} is not an eligible game")
+
+        prices_json = self.steam.fetch_regional_prices(appid, force_refresh=force_refresh)
+        timestamp = _utc_now()
+        self.database.update_regional_prices(
+            appid,
+            prices_json,
+            fetched_at=timestamp,
+            expected_lease_token=lease_token,
+        )
+        return CollectionResult(appid, "eligible")
+
     def collect_review_samples(
-        self, appid: int, summary: ReviewPage
+        self,
+        appid: int,
+        summary: ReviewPage,
+        *,
+        recent_page: ReviewPage | None = None,
     ) -> dict[SampleKind, list[Review]]:
         """Collect helpful/recent samples with targeted shortfall fallbacks."""
         samples: dict[SampleKind, list[Review]] = {}
@@ -253,7 +282,7 @@ class CatalogPipeline:
         }
         for sample_prefix, filter_name in (("helpful", "all"), ("recent", "recent")):
             broad = (
-                summary
+                recent_page or self.steam.fetch_reviews(appid, filter_name, "all", 100)
                 if sample_prefix == "recent"
                 else self.steam.fetch_reviews(appid, filter_name, "all", 100)
             )

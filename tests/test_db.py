@@ -29,6 +29,7 @@ EXPECTED_COLUMNS = {
         "header_image_url",
         "screenshots_json",
         "prices_json",
+        "regional_prices_fetched_at",
         "steamspy_positive",
         "steamspy_negative",
         "steam_total_positive",
@@ -119,6 +120,7 @@ EXPECTED_TABLE_INFO = {
         ("header_image_url", "TEXT", 0, None, 0),
         ("screenshots_json", "TEXT", 0, None, 0),
         ("prices_json", "TEXT", 0, None, 0),
+        ("regional_prices_fetched_at", "TEXT", 0, None, 0),
         ("steamspy_positive", "INTEGER", 0, None, 0),
         ("steamspy_negative", "INTEGER", 0, None, 0),
         ("steam_total_positive", "INTEGER", 0, None, 0),
@@ -347,7 +349,7 @@ def test_initialize_is_idempotent(tmp_path):
     try:
         db.initialize()
         db.initialize()
-        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
     finally:
         db.close()
 
@@ -385,9 +387,10 @@ def test_initialize_adds_lease_token_to_existing_version_one_schema(tmp_path):
     try:
         db.initialize()
 
-        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert db.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
         assert "price_json" not in _column_names(db, "games")
         assert "prices_json" in _column_names(db, "games")
+        assert "regional_prices_fetched_at" in _column_names(db, "games")
         assert db.connection.execute("SELECT prices_json FROM games").fetchone()[0] is None
         assert _column_names(db, "sync_jobs") == EXPECTED_COLUMNS["sync_jobs"]
         assert (

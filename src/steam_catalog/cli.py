@@ -51,6 +51,17 @@ class _CollectionEvent:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _PriceEvent:
+    sequence: int
+    total: int
+    appid: int
+    name: str | None
+    outcome: Literal["saved", "retry", "failed"]
+    elapsed_seconds: float
+    error: str | None = None
+
+
 @dataclass
 class _CollectionProgress:
     outcomes: dict[str, str] = field(default_factory=dict)
@@ -112,6 +123,26 @@ def _print_collection_summary(
         f"Saved: {progress.saved}; Skipped: {progress.skipped}; "
         f"Retrying: {progress.retrying}; Permanent failures: {progress.permanent_failures}; "
         f"Elapsed: {elapsed_seconds:.1f}s"
+    )
+
+
+def _print_price_event(event: _PriceEvent) -> None:
+    name = event.name or "Unknown name"
+    label = "prices saved" if event.outcome == "saved" else event.outcome
+    error = f": {event.error}" if event.error else ""
+    typer.echo(
+        f"[{event.sequence}/{event.total}] {name} (appid {event.appid}) - "
+        f"{label}, {event.elapsed_seconds:.1f}s{error}"
+    )
+
+
+def _print_price_summary(
+    progress: _CollectionProgress, elapsed_seconds: float, *, interrupted: bool = False
+) -> None:
+    prefix = "Interrupted. " if interrupted else ""
+    typer.echo(
+        f"{prefix}Saved: {progress.saved}; Retrying: {progress.retrying}; "
+        f"Permanent failures: {progress.permanent_failures}; Elapsed: {elapsed_seconds:.1f}s"
     )
 
 
@@ -460,6 +491,157 @@ def _collect_claimed_job(
     )
 
 
+def _consume_price_jobs(
+    database: Database,
+    pipeline: CatalogPipeline,
+    settings: Settings,
+    *,
+    limit: int | None,
+    progress: _CollectionProgress,
+) -> None:
+    """Consume resumable regional-price jobs with durable progress output."""
+    active_lease_token: str | None = None
+    active_item_key: str | None = None
+    try:
+        display_total = database.job_queue_size("collect_prices")
+        if limit is not None:
+            display_total = min(display_total, limit)
+        while limit is None or progress.total < limit:
+            active_lease_token = secrets.token_urlsafe(32)
+            lease = database.claim_job("collect_prices", lease_token=active_lease_token)
+            if lease is None:
+                active_lease_token = None
+                break
+            active_item_key = lease["item_key"]
+            try:
+                _collect_claimed_price_job(
+                    database,
+                    pipeline,
+                    settings,
+                    item_key=active_item_key,
+                    lease_token=active_lease_token,
+                    sequence=progress.total + 1,
+                    display_total=display_total,
+                    progress=progress,
+                )
+            except _EXPECTED_ERRORS:
+                pass
+            active_lease_token = None
+            active_item_key = None
+    except KeyboardInterrupt:
+        _reconcile_active_price_job(database, active_lease_token, active_item_key, progress)
+        raise
+
+
+def _reconcile_active_price_job(
+    database: Database,
+    lease_token: str | None,
+    item_key: str | None,
+    progress: _CollectionProgress,
+) -> None:
+    if lease_token is None:
+        return
+    released = database.release_job_by_lease("collect_prices", lease_token)
+    if released or item_key is None or item_key in progress.outcomes:
+        return
+    status = database.job_status("collect_prices", item_key)
+    if status == "complete":
+        progress.record(item_key, "saved")
+    elif status in {"failed", "permanent_failure"}:
+        progress.record(item_key, "failed" if status == "permanent_failure" else "retry")
+
+
+def _collect_claimed_price_job(
+    database: Database,
+    pipeline: CatalogPipeline,
+    settings: Settings,
+    *,
+    item_key: str,
+    lease_token: str,
+    sequence: int,
+    display_total: int,
+    progress: _CollectionProgress,
+    force_refresh: bool = False,
+) -> None:
+    appid = int(item_key)
+    started = monotonic()
+    try:
+        pipeline.collect_prices_one(appid, lease_token=lease_token, force_refresh=force_refresh)
+    except _EXPECTED_ERRORS as error:
+        database.fail_job(
+            "collect_prices",
+            item_key,
+            error,
+            expected_lease_token=lease_token,
+            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            max_attempts=settings.max_attempts,
+        )
+        job_status = database.job_status("collect_prices", item_key)
+        outcome: Literal["retry", "failed"] = (
+            "failed" if job_status == "permanent_failure" else "retry"
+        )
+        progress.record(item_key, outcome)
+        name, _, _ = database.game_progress_details(appid)
+        _print_price_event(
+            _PriceEvent(
+                sequence=sequence,
+                total=display_total,
+                appid=appid,
+                name=name,
+                outcome=outcome,
+                elapsed_seconds=monotonic() - started,
+                error=str(error),
+            )
+        )
+        raise
+
+    progress.record(item_key, "saved")
+    name, _, _ = database.game_progress_details(appid)
+    _print_price_event(
+        _PriceEvent(
+            sequence=sequence,
+            total=display_total,
+            appid=appid,
+            name=name,
+            outcome="saved",
+            elapsed_seconds=monotonic() - started,
+        )
+    )
+
+
+def _collect_specific_prices(
+    database: Database,
+    settings: Settings,
+    appid: int,
+    progress: _CollectionProgress,
+) -> None:
+    if database.game_status(appid) != "eligible":
+        raise ValueError(f"appid {appid} is not an eligible game")
+    item_key = str(appid)
+    lease_token = secrets.token_urlsafe(32)
+    lease = database.requeue_and_claim_specific_job(
+        "collect_prices", item_key, lease_token=lease_token
+    )
+    if lease is None:
+        raise ValueError(f"Price job for appid {appid} is already running")
+    try:
+        with _pipeline(database, settings) as pipeline:
+            _collect_claimed_price_job(
+                database,
+                pipeline,
+                settings,
+                item_key=item_key,
+                lease_token=lease_token,
+                sequence=1,
+                display_total=1,
+                progress=progress,
+                force_refresh=True,
+            )
+    except KeyboardInterrupt:
+        _reconcile_active_price_job(database, lease_token, item_key, progress)
+        raise
+
+
 @app.command("collect")
 @_command_errors
 def collect_command(
@@ -502,6 +684,41 @@ def collect_command(
         return
 
     _print_collection_summary(progress, monotonic() - started)
+    if progress.failed:
+        raise typer.Exit(1)
+
+
+@app.command("collect-prices")
+@_command_errors
+def collect_prices_command(
+    context: typer.Context,
+    limit: Annotated[int | None, typer.Option("--limit", min=1)] = None,
+    appid: Annotated[int | None, typer.Option("--appid", min=1)] = None,
+) -> None:
+    """Collect USD and UAH prices for eligible games in a separate pass."""
+    settings: Settings = context.obj
+    progress = _CollectionProgress()
+    started = monotonic()
+    try:
+        with _database(settings) as database:
+            if appid is not None:
+                _collect_specific_prices(database, settings, appid, progress)
+            else:
+                scheduled = database.schedule_price_collection()
+                typer.echo(f"Price jobs ready: {scheduled}")
+                with _pipeline(database, settings) as pipeline:
+                    _consume_price_jobs(
+                        database,
+                        pipeline,
+                        settings,
+                        limit=limit,
+                        progress=progress,
+                    )
+    except KeyboardInterrupt as error:
+        _print_price_summary(progress, monotonic() - started, interrupted=True)
+        raise typer.Exit(130) from error
+
+    _print_price_summary(progress, monotonic() - started)
     if progress.failed:
         raise typer.Exit(1)
 
