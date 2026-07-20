@@ -794,6 +794,8 @@ def test_collect_appid_failure_uses_bounded_job_failure_lifecycle(tmp_path: Path
     result = runner.invoke(app, ["--database", str(path), "collect", "--appid", "4000"])
 
     assert result.exit_code == 1
+    assert "[1/1] Unknown name (appid 4000) - retry," in result.stdout
+    assert "source failed" in result.stdout
     database = _open_database(path)
     row = database.connection.execute(
         "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '4000'"
@@ -878,6 +880,12 @@ def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch
             def collect_one(self, appid: int, *, lease_token: str | None = None):
                 assert appid == 4000
                 assert lease_token is not None
+                database.upsert_game(
+                    appid=appid,
+                    name="Garry's Mod",
+                    eligibility_status="eligible",
+                    updated_at="2026-07-20T00:00:00+00:00",
+                )
                 database.complete_job("collect", str(appid), expected_lease_token=lease_token)
                 return CollectionResult(appid=appid, status="eligible")
 
@@ -892,4 +900,69 @@ def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch
 
     assert result.exit_code == 0
     assert "eligible: 1" in result.stdout.lower()
-    assert "review" not in result.stdout.lower()
+    assert "[1/1] Garry's Mod (appid 4000) - saved, reviews=0," in result.stdout
+    assert "review text" not in result.stdout.lower()
+
+
+def test_collect_prints_one_post_commit_line_per_game(tmp_path: Path, monkeypatch):
+    path = tmp_path / "progress.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.enqueue_job("collect", "20")
+    database.close()
+
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class CompletingPipeline:
+            def collect_one(self, appid: int, *, lease_token: str | None = None):
+                database.upsert_game(
+                    appid=appid,
+                    name=f"Game {appid}",
+                    eligibility_status="eligible",
+                    updated_at="2026-07-20T00:00:00+00:00",
+                )
+                database.complete_job("collect", str(appid), expected_lease_token=lease_token)
+                return CollectionResult(appid=appid, status="eligible")
+
+        yield CompletingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(app, ["--database", str(path), "collect"])
+
+    assert result.exit_code == 0
+    assert "[1/2] Game 10 (appid 10) - saved, reviews=0," in result.stdout
+    assert "[2/2] Game 20 (appid 20) - saved, reviews=0," in result.stdout
+
+
+def test_collect_prints_retry_only_after_failure_is_durable(tmp_path: Path, monkeypatch):
+    path = tmp_path / "retry-progress.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+    durable_statuses: list[str | None] = []
+    print_event = cli_module._print_collection_event
+
+    class FailingPipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            raise ValueError("source failed")
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield FailingPipeline()
+
+    def inspect_event(event):
+        current = _open_database(path)
+        durable_statuses.append(current.job_status("collect", str(event.appid)))
+        current.close()
+        print_event(event)
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+    monkeypatch.setattr("steam_catalog.cli._print_collection_event", inspect_event)
+
+    result = runner.invoke(app, ["--database", str(path), "collect"])
+
+    assert result.exit_code == 1
+    assert durable_statuses == ["failed"]
+    assert "[1/1] Unknown name (appid 10) - retry," in result.stdout
+    assert "source failed" in result.stdout

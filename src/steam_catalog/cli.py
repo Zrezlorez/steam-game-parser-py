@@ -9,7 +9,8 @@ from functools import wraps
 from pathlib import Path
 import secrets
 import sqlite3
-from typing import Annotated, Any, ParamSpec, TypeVar
+from time import monotonic
+from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar
 
 import httpx
 import typer
@@ -34,26 +35,79 @@ class ExportFormat(str, Enum):
     CSV = "csv"
 
 
+CollectionOutcome: TypeAlias = Literal["saved", "skipped", "retry", "failed"]
+
+
+@dataclass(frozen=True)
+class _CollectionEvent:
+    sequence: int
+    total: int
+    appid: int
+    name: str | None
+    outcome: CollectionOutcome
+    review_count: int
+    elapsed_seconds: float
+    error: str | None = None
+
+
 @dataclass
 class _CollectionProgress:
     outcomes: dict[str, str] = field(default_factory=dict)
 
-    def record(self, item_key: str, outcome: str) -> None:
-        if outcome not in {"complete", "failed"}:
+    def record(self, item_key: str, outcome: CollectionOutcome) -> None:
+        if outcome not in {"saved", "skipped", "retry", "failed"}:
             raise ValueError(f"Unsupported collection outcome: {outcome}")
         self.outcomes[item_key] = outcome
 
     @property
     def completed(self) -> int:
-        return sum(outcome == "complete" for outcome in self.outcomes.values())
+        return self.saved + self.skipped
 
     @property
     def failed(self) -> int:
-        return sum(outcome == "failed" for outcome in self.outcomes.values())
+        return self.retrying + self.permanent_failures
 
     @property
     def total(self) -> int:
         return len(self.outcomes)
+
+    @property
+    def saved(self) -> int:
+        return sum(outcome == "saved" for outcome in self.outcomes.values())
+
+    @property
+    def skipped(self) -> int:
+        return sum(outcome == "skipped" for outcome in self.outcomes.values())
+
+    @property
+    def retrying(self) -> int:
+        return sum(outcome == "retry" for outcome in self.outcomes.values())
+
+    @property
+    def permanent_failures(self) -> int:
+        return sum(outcome == "failed" for outcome in self.outcomes.values())
+
+
+def _print_collection_event(event: _CollectionEvent) -> None:
+    name = event.name or "Unknown name"
+    detail = f", reviews={event.review_count}" if event.outcome == "saved" else ""
+    error = f": {event.error}" if event.error else ""
+    typer.echo(
+        f"[{event.sequence}/{event.total}] {name} (appid {event.appid}) - "
+        f"{event.outcome}{detail}, {event.elapsed_seconds:.1f}s{error}"
+    )
+
+
+def _print_collection_summary(
+    progress: _CollectionProgress, elapsed_seconds: float, *, interrupted: bool = False
+) -> None:
+    prefix = "Interrupted. " if interrupted else ""
+    typer.echo(f"{prefix}Completed: {progress.completed}; Failed: {progress.failed}")
+    typer.echo(
+        f"Saved: {progress.saved}; Skipped: {progress.skipped}; "
+        f"Retrying: {progress.retrying}; Permanent failures: {progress.permanent_failures}; "
+        f"Elapsed: {elapsed_seconds:.1f}s"
+    )
 
 
 _P = ParamSpec("_P")
@@ -155,6 +209,167 @@ def bootstrap_command(
     typer.echo(f"Queued: {stats.queued}")
 
 
+def _consume_collection_jobs(
+    database: Database,
+    pipeline: CatalogPipeline,
+    settings: Settings,
+    *,
+    limit: int | None,
+    on_event: Callable[[_CollectionEvent], None],
+    progress: _CollectionProgress,
+) -> None:
+    """Consume collection work while publishing only durable outcomes."""
+    active_lease_token: str | None = None
+    active_item_key: str | None = None
+    try:
+        display_total = database.collection_queue_size()
+        if limit is not None:
+            display_total = min(display_total, limit)
+        while limit is None or progress.total < limit:
+            active_lease_token = secrets.token_urlsafe(32)
+            lease = database.claim_job("collect", lease_token=active_lease_token)
+            if lease is None:
+                active_lease_token = None
+                break
+            item_key = lease["item_key"]
+            active_item_key = item_key
+            try:
+                _collect_claimed_job(
+                    database,
+                    pipeline,
+                    settings,
+                    item_key=item_key,
+                    lease_token=active_lease_token,
+                    sequence=progress.total + 1,
+                    display_total=display_total,
+                    on_event=on_event,
+                    progress=progress,
+                )
+            except _EXPECTED_ERRORS:
+                pass
+            active_lease_token = None
+            active_item_key = None
+    except KeyboardInterrupt:
+        _reconcile_active_job(database, active_lease_token, active_item_key, progress)
+        raise
+
+
+def _collect_specific_app(
+    database: Database,
+    settings: Settings,
+    appid: int,
+    *,
+    on_event: Callable[[_CollectionEvent], None],
+    progress: _CollectionProgress,
+) -> None:
+    item_key = str(appid)
+    lease_token = secrets.token_urlsafe(32)
+    lease = database.requeue_and_claim_specific_job(
+        "collect", item_key, lease_token=lease_token
+    )
+    if lease is None:
+        raise ValueError(f"Collect job for appid {appid} is already running")
+    try:
+        with _pipeline(database, settings) as pipeline:
+            _collect_claimed_job(
+                database,
+                pipeline,
+                settings,
+                item_key=item_key,
+                lease_token=lease_token,
+                sequence=1,
+                display_total=1,
+                on_event=on_event,
+                progress=progress,
+            )
+    except KeyboardInterrupt:
+        _reconcile_active_job(database, lease_token, item_key, progress)
+        raise
+
+
+def _reconcile_active_job(
+    database: Database,
+    lease_token: str | None,
+    item_key: str | None,
+    progress: _CollectionProgress,
+) -> None:
+    if lease_token is None:
+        return
+    released = database.release_job_by_lease("collect", lease_token)
+    if released or item_key is None or item_key in progress.outcomes:
+        return
+    active_status = database.job_status("collect", item_key)
+    if active_status == "complete":
+        game_status = database.game_status(int(item_key))
+        progress.record(item_key, "saved" if game_status == "eligible" else "skipped")
+    elif active_status in {"failed", "permanent_failure"}:
+        progress.record(
+            item_key,
+            "failed" if active_status == "permanent_failure" else "retry",
+        )
+
+
+def _collect_claimed_job(
+    database: Database,
+    pipeline: CatalogPipeline,
+    settings: Settings,
+    *,
+    item_key: str,
+    lease_token: str,
+    sequence: int,
+    display_total: int,
+    on_event: Callable[[_CollectionEvent], None],
+    progress: _CollectionProgress,
+) -> None:
+    appid = int(item_key)
+    started = monotonic()
+    try:
+        result = pipeline.collect_one(appid, lease_token=lease_token)
+    except _EXPECTED_ERRORS as error:
+        database.fail_job(
+            "collect",
+            item_key,
+            error,
+            expected_lease_token=lease_token,
+            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            max_attempts=settings.max_attempts,
+        )
+        job_status = database.job_status("collect", item_key)
+        outcome: CollectionOutcome = (
+            "failed" if job_status == "permanent_failure" else "retry"
+        )
+        progress.record(item_key, outcome)
+        name, review_count = database.game_progress_details(appid)
+        on_event(
+            _CollectionEvent(
+                sequence=sequence,
+                total=display_total,
+                appid=appid,
+                name=name,
+                outcome=outcome,
+                review_count=review_count,
+                elapsed_seconds=monotonic() - started,
+                error=str(error),
+            )
+        )
+        raise
+
+    outcome = "saved" if result.status == "eligible" else "skipped"
+    progress.record(item_key, outcome)
+    name, review_count = database.game_progress_details(appid)
+    on_event(
+        _CollectionEvent(
+            sequence=sequence,
+            total=display_total,
+            appid=appid,
+            name=name,
+            outcome=outcome,
+            review_count=review_count,
+            elapsed_seconds=monotonic() - started,
+        )
+    )
+
+
 @app.command("collect")
 @_command_errors
 def collect_command(
@@ -165,90 +380,38 @@ def collect_command(
     """Collect one app or consume resumable queued work."""
     settings: Settings = context.obj
     progress = _CollectionProgress()
-    active_lease_token: str | None = None
-    active_item_key: str | None = None
+    started = monotonic()
+    direct_status: str | None = None
     try:
         with _database(settings) as database:
             if appid is not None:
-                item_key = str(appid)
-                active_lease_token = secrets.token_urlsafe(32)
-                active_item_key = item_key
-                lease = database.requeue_and_claim_specific_job(
-                    "collect", item_key, lease_token=active_lease_token
+                _collect_specific_app(
+                    database,
+                    settings,
+                    appid=appid,
+                    on_event=_print_collection_event,
+                    progress=progress,
                 )
-                if lease is None:
-                    active_lease_token = None
-                    active_item_key = None
-                    raise ValueError(f"Collect job for appid {appid} is already running")
+                direct_status = database.game_status(appid)
+            else:
                 with _pipeline(database, settings) as pipeline:
-                    try:
-                        result = pipeline.collect_one(appid, lease_token=active_lease_token)
-                    except _EXPECTED_ERRORS as error:
-                        database.fail_job(
-                            "collect",
-                            item_key,
-                            error,
-                            expected_lease_token=active_lease_token,
-                            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-                            max_attempts=settings.max_attempts,
-                        )
-                        progress.record(item_key, "failed")
-                        active_lease_token = None
-                        active_item_key = None
-                        raise
-                    progress.record(item_key, "complete")
-                active_lease_token = None
-                active_item_key = None
-                typer.echo(f"{result.status.replace('_', '-')}: 1")
-                return
-
-            with _pipeline(database, settings) as pipeline:
-                while limit is None or progress.total < limit:
-                    active_lease_token = secrets.token_urlsafe(32)
-                    lease = database.claim_job("collect", lease_token=active_lease_token)
-                    if lease is None:
-                        active_lease_token = None
-                        break
-                    item_key = lease["item_key"]
-                    active_item_key = item_key
-                    try:
-                        pipeline.collect_one(int(item_key), lease_token=active_lease_token)
-                    except _EXPECTED_ERRORS as error:
-                        database.fail_job(
-                            "collect",
-                            item_key,
-                            error,
-                            expected_lease_token=active_lease_token,
-                            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-                            max_attempts=settings.max_attempts,
-                        )
-                        progress.record(item_key, "failed")
-                        active_lease_token = None
-                        active_item_key = None
-                        typer.echo(f"Failed appid {item_key}: {error}")
-                    else:
-                        progress.record(item_key, "complete")
-                        active_lease_token = None
-                        active_item_key = None
+                    _consume_collection_jobs(
+                        database,
+                        pipeline,
+                        settings,
+                        limit=limit,
+                        on_event=_print_collection_event,
+                        progress=progress,
+                    )
     except KeyboardInterrupt as error:
-        with _database(settings) as database:
-            if active_lease_token is not None:
-                released = database.release_job_by_lease("collect", active_lease_token)
-                if (
-                    not released
-                    and active_item_key is not None
-                    and active_item_key not in progress.outcomes
-                ):
-                    active_status = database.job_status("collect", active_item_key)
-                    if active_status == "complete":
-                        progress.record(active_item_key, "complete")
-                    elif active_status in {"failed", "permanent_failure"}:
-                        progress.record(active_item_key, "failed")
-        typer.echo(f"Interrupted. Completed: {progress.completed}; Failed: {progress.failed}")
+        _print_collection_summary(progress, monotonic() - started, interrupted=True)
         raise typer.Exit(130) from error
 
-    typer.echo(f"Completed: {progress.completed}")
-    typer.echo(f"Failed: {progress.failed}")
+    if appid is not None:
+        typer.echo(f"{(direct_status or 'unknown').replace('_', '-')}: 1")
+        return
+
+    _print_collection_summary(progress, monotonic() - started)
     if progress.failed:
         raise typer.Exit(1)
 
