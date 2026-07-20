@@ -876,7 +876,7 @@ class Database:
                 """
                 SELECT jobs.item_key
                 FROM sync_jobs AS jobs
-                LEFT JOIN games ON CAST(games.appid AS TEXT) = jobs.item_key
+                LEFT JOIN games ON games.appid = CAST(jobs.item_key AS INTEGER)
                 WHERE jobs.job_kind = ?
                   AND jobs.status IN ('pending', 'failed')
                   AND jobs.attempt_count < ?
