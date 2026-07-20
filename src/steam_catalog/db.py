@@ -2,10 +2,11 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 
-from steam_catalog.models import EligibilityStatus
+from steam_catalog.models import DiscoveryItem, EligibilityStatus
 
 
 SCHEMA_VERSION = 1
@@ -183,11 +184,12 @@ class Database:
             self.connection.execute(
                 "INSERT INTO schema_version(version) VALUES(?)", (SCHEMA_VERSION,)
             )
-            return
+        else:
+            version = version_row["version"]
+            if version != SCHEMA_VERSION:
+                raise RuntimeError(f"Unsupported SQLite schema version: {version}")
 
-        version = version_row["version"]
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(f"Unsupported SQLite schema version: {version}")
+        self._recover_stale_jobs()
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -486,6 +488,286 @@ class Database:
                 ),
             )
 
+    def upsert_source_item(
+        self,
+        source: str,
+        item: DiscoveryItem,
+        *,
+        source_page: int | None = None,
+        fetched_at: str | None = None,
+    ) -> None:
+        """Persist one discovery payload and a metadata-preserving minimal game row."""
+        timestamp = fetched_at or _utc_now()
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT name FROM games WHERE appid = ?", (item.appid,)
+            ).fetchone()
+            if existing is None:
+                self.upsert_game(
+                    appid=item.appid,
+                    name=item.name,
+                    eligibility_status="pending",
+                    updated_at=timestamp,
+                    steamspy_positive=item.steamspy_positive,
+                    steamspy_negative=item.steamspy_negative,
+                )
+            else:
+                name = item.name or existing["name"]
+                self._delete_game_search_row(item.appid)
+                self.connection.execute(
+                    """
+                    UPDATE games
+                    SET name = ?,
+                        steamspy_positive = COALESCE(?, steamspy_positive),
+                        steamspy_negative = COALESCE(?, steamspy_negative),
+                        updated_at = ?
+                    WHERE appid = ?
+                    """,
+                    (
+                        name,
+                        item.steamspy_positive,
+                        item.steamspy_negative,
+                        timestamp,
+                        item.appid,
+                    ),
+                )
+                self._insert_game_search_row(item.appid)
+
+            self.connection.execute(
+                """
+                INSERT INTO source_items(source, appid, source_page, payload_json, fetched_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(source, appid) DO UPDATE SET
+                    source_page = excluded.source_page,
+                    payload_json = excluded.payload_json,
+                    fetched_at = excluded.fetched_at
+                """,
+                (source, item.appid, source_page, item.payload_json, timestamp),
+            )
+
+    def enqueue_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        *,
+        resume: bool = True,
+        updated_at: str | None = None,
+    ) -> bool:
+        """Queue work, preserving existing progress when resuming."""
+        timestamp = updated_at or _utc_now()
+        with self.transaction():
+            if resume:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO sync_jobs(job_kind, item_key, status, updated_at)
+                    VALUES(?, ?, 'pending', ?)
+                    ON CONFLICT(job_kind, item_key) DO NOTHING
+                    """,
+                    (job_kind, item_key, timestamp),
+                )
+            else:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO sync_jobs(job_kind, item_key, status, updated_at)
+                    VALUES(?, ?, 'pending', ?)
+                    ON CONFLICT(job_kind, item_key) DO UPDATE SET
+                        status = 'pending',
+                        attempt_count = 0,
+                        next_attempt_at = NULL,
+                        last_error = NULL,
+                        updated_at = excluded.updated_at
+                    """,
+                    (job_kind, item_key, timestamp),
+                )
+            return cursor.rowcount > 0
+
+    def discard_job(self, job_kind: str, item_key: str) -> None:
+        """Remove work that no longer satisfies provisional eligibility."""
+        with self.transaction():
+            self.connection.execute(
+                "DELETE FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
+                (job_kind, item_key),
+            )
+
+    def claim_job(self, job_kind: str, *, now: str | None = None) -> sqlite3.Row | None:
+        """Atomically claim the oldest due job and increment its attempt count."""
+        timestamp = now or _utc_now()
+        with self.transaction():
+            candidate = self.connection.execute(
+                """
+                SELECT item_key
+                FROM sync_jobs
+                WHERE job_kind = ?
+                  AND status IN ('pending', 'failed')
+                  AND (
+                      next_attempt_at IS NULL
+                      OR julianday(next_attempt_at) <= julianday(?)
+                  )
+                ORDER BY updated_at, item_key
+                LIMIT 1
+                """,
+                (job_kind, timestamp),
+            ).fetchone()
+            if candidate is None:
+                return None
+            self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'running', attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                """,
+                (timestamp, job_kind, candidate["item_key"]),
+            )
+            return self.connection.execute(
+                "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
+                (job_kind, candidate["item_key"]),
+            ).fetchone()
+
+    def complete_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        *,
+        updated_at: str | None = None,
+    ) -> None:
+        """Record successful terminal completion for a job."""
+        with self.transaction():
+            self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'complete', next_attempt_at = NULL, last_error = NULL,
+                    updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                """,
+                (updated_at or _utc_now(), job_kind, item_key),
+            )
+
+    def fail_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        error: BaseException | str,
+        *,
+        next_attempt_at: str,
+        max_attempts: int,
+        updated_at: str | None = None,
+    ) -> None:
+        """Schedule a bounded failure for retry or make it permanently terminal."""
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        with self.transaction():
+            row = self.connection.execute(
+                """
+                SELECT attempt_count FROM sync_jobs
+                WHERE job_kind = ? AND item_key = ?
+                """,
+                (job_kind, item_key),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown job: {job_kind}/{item_key}")
+            permanent = row["attempt_count"] >= max_attempts
+            self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                """,
+                (
+                    "permanent_failure" if permanent else "failed",
+                    None if permanent else next_attempt_at,
+                    str(error)[:1000],
+                    updated_at or _utc_now(),
+                    job_kind,
+                    item_key,
+                ),
+            )
+
+    def record_game_status(
+        self,
+        appid: int,
+        status: str,
+        *,
+        skip_reason: str | None = None,
+        updated_at: str | None = None,
+        steam_total_positive: int | None = None,
+        steam_total_negative: int | None = None,
+        steam_total_reviews: int | None = None,
+        review_score: int | None = None,
+        review_score_desc: str | None = None,
+        reviews_fetched_at: str | None = None,
+        replace_steam_aggregate: bool = False,
+    ) -> None:
+        """Update eligibility and aggregate fields without replacing prior metadata."""
+        timestamp = updated_at or _utc_now()
+        with self.transaction():
+            inserted = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO games(appid, name, eligibility_status, updated_at)
+                VALUES(?, '', ?, ?)
+                """,
+                (appid, status, timestamp),
+            )
+            if inserted.rowcount > 0:
+                self._insert_game_search_row(appid)
+            if replace_steam_aggregate:
+                self.connection.execute(
+                    """
+                    UPDATE games
+                    SET steam_total_positive = ?, steam_total_negative = ?,
+                        steam_total_reviews = ?, review_score = ?, review_score_desc = ?,
+                        eligibility_status = ?, skip_reason = ?, reviews_fetched_at = ?,
+                        updated_at = ?
+                    WHERE appid = ?
+                    """,
+                    (
+                        steam_total_positive,
+                        steam_total_negative,
+                        steam_total_reviews,
+                        review_score,
+                        review_score_desc,
+                        status,
+                        skip_reason,
+                        reviews_fetched_at,
+                        timestamp,
+                        appid,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE games
+                    SET eligibility_status = ?, skip_reason = ?, updated_at = ?
+                    WHERE appid = ?
+                    """,
+                    (status, skip_reason, timestamp, appid),
+                )
+
+    def next_source_page(self, source: str) -> int:
+        """Return the first SteamSpy page not represented in source items."""
+        row = self.connection.execute(
+            "SELECT MAX(source_page) FROM source_items WHERE source = ?", (source,)
+        ).fetchone()
+        return 0 if row[0] is None else row[0] + 1
+
+    def job_status(self, job_kind: str, item_key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT status FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
+            (job_kind, item_key),
+        ).fetchone()
+        return None if row is None else row["status"]
+
+    def game_status(self, appid: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT eligibility_status FROM games WHERE appid = ?", (appid,)
+        ).fetchone()
+        return None if row is None else row["eligibility_status"]
+
+    def review_count(self, appid: int) -> int:
+        return self.connection.execute(
+            "SELECT COUNT(*) FROM reviews WHERE appid = ?", (appid,)
+        ).fetchone()[0]
+
     def _delete_game_search_row(self, appid: int) -> None:
         self.connection.execute(
             """
@@ -516,3 +798,37 @@ class Database:
             """,
             (recommendation_id,),
         )
+
+    def _insert_game_search_row(self, appid: int) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO game_search(
+                rowid, name, short_description_text, detailed_description_text,
+                about_the_game_text, developers, publishers, genres, categories
+            )
+            SELECT
+                appid, name, COALESCE(short_description_text, ''),
+                COALESCE(detailed_description_text, ''), COALESCE(about_the_game_text, ''),
+                COALESCE(developers_json, ''), COALESCE(publishers_json, ''),
+                COALESCE(genres_json, ''), COALESCE(categories_json, '')
+            FROM games
+            WHERE appid = ?
+            """,
+            (appid,),
+        )
+
+    def _recover_stale_jobs(self) -> None:
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=1)).isoformat()
+        self.connection.execute(
+            """
+            UPDATE sync_jobs
+            SET status = 'pending', next_attempt_at = NULL, updated_at = ?
+            WHERE status = 'running' AND julianday(updated_at) < julianday(?)
+            """,
+            (now.isoformat(), cutoff),
+        )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
