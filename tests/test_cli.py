@@ -53,6 +53,7 @@ def test_help_lists_exact_command_surface():
         "import-library",
         "status",
         "export",
+        "run",
     ):
         assert command in result.stdout
 
@@ -274,6 +275,102 @@ def test_bootstrap_delegates_without_printing_payloads(tmp_path: Path, monkeypat
     assert "discovered: 3" in result.stdout.lower()
     assert "queued: 2" in result.stdout.lower()
     assert "payload" not in result.stdout.lower()
+
+
+def test_run_orchestrates_all_phases_and_forwards_options(tmp_path: Path, monkeypatch):
+    library = tmp_path / "library.json"
+    library.write_text('[{"appid":10,"name":"Owned"}]', encoding="utf-8")
+    observed: list[object] = []
+
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class FakePipeline:
+            bootstrap_progress = RunStats()
+
+            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+                observed.append((source, resume, page_limit))
+                return RunStats(discovered=1, queued=0)
+
+        yield FakePipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        [
+            "--database",
+            str(tmp_path / "catalog.sqlite3"),
+            "run",
+            "--library",
+            str(library),
+            "--source",
+            "steam",
+            "--no-resume",
+            "--page-limit",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert observed == [("steam", False, 2)]
+    assert result.stdout.index("Initialize") < result.stdout.index("Import library")
+    assert result.stdout.index("Import library") < result.stdout.index("Discover")
+    assert result.stdout.index("Discover") < result.stdout.index("Collect")
+    assert result.stdout.index("Collect") < result.stdout.index("Summary")
+
+
+def test_run_without_library_omits_import_phase(tmp_path: Path, monkeypatch):
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class FakePipeline:
+            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+                return RunStats()
+
+        yield FakePipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "run", "--page-limit", "1"],
+    )
+
+    assert result.exit_code == 0
+    assert "Import library" not in result.stdout
+
+
+def test_run_interrupt_releases_active_collection_job(tmp_path: Path, monkeypatch):
+    path = tmp_path / "run-interrupt.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class InterruptingPipeline:
+            bootstrap_progress = RunStats()
+
+            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+                return RunStats()
+
+            def collect_one(self, appid: int, *, lease_token: str | None = None):
+                raise KeyboardInterrupt
+
+        yield InterruptingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(app, ["--database", str(path), "run", "--page-limit", "1"])
+
+    assert result.exit_code == 130
+    assert "Summary" in result.stdout
+    assert "Interrupted. Completed: 0; Failed: 0" in result.stdout
+    database = _open_database(path)
+    row = database.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("pending", 0, None)
+    database.close()
 
 
 def test_bootstrap_keyboard_interrupt_reports_progress_and_exits_130(tmp_path: Path, monkeypatch):

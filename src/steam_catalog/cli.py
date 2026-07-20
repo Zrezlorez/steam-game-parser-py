@@ -209,6 +209,77 @@ def bootstrap_command(
     typer.echo(f"Queued: {stats.queued}")
 
 
+@app.command("run")
+@_command_errors
+def run_command(
+    context: typer.Context,
+    library: Annotated[
+        Path | None, typer.Option("--library", help="Steam library JSON path.", dir_okay=False)
+    ] = None,
+    source: Annotated[DiscoverySource, typer.Option("--source")] = DiscoverySource.STEAMSPY,
+    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = True,
+    page_limit: Annotated[int | None, typer.Option("--page-limit", min=1)] = None,
+) -> None:
+    """Initialize, optionally import, discover, and collect until idle."""
+    settings: Settings = context.obj
+    collection_progress = _CollectionProgress()
+    bootstrap_stats = RunStats()
+    active_pipeline: CatalogPipeline | None = None
+    phase = "initialize"
+    started = monotonic()
+    try:
+        with _database(settings) as database:
+            typer.echo(f"Initialize: {database.path}")
+            if library is not None:
+                phase = "import"
+                typer.echo(f"Import library: {library}")
+                import_stats = import_library(database, library)
+                typer.echo(
+                    f"Imported: {import_stats.imported}; "
+                    f"Placeholders created: {import_stats.placeholders_created}"
+                )
+
+            phase = "discover"
+            typer.echo(f"Discover: {source.value}")
+            with _pipeline(database, settings) as pipeline:
+                active_pipeline = pipeline
+                bootstrap_stats = pipeline.bootstrap(
+                    source.value, resume=resume, page_limit=page_limit
+                )
+                typer.echo(f"Discovered: {bootstrap_stats.discovered}")
+                typer.echo(f"Queued: {bootstrap_stats.queued}")
+
+                phase = "collect"
+                typer.echo("Collect")
+                _consume_collection_jobs(
+                    database,
+                    pipeline,
+                    settings,
+                    limit=None,
+                    on_event=_print_collection_event,
+                    progress=collection_progress,
+                )
+    except KeyboardInterrupt as error:
+        if phase == "discover":
+            durable = getattr(active_pipeline, "bootstrap_progress", bootstrap_stats)
+            typer.echo("Interrupted; completed discovery pages remain resumable.")
+            typer.echo(f"Discovered: {durable.discovered}")
+            typer.echo(f"Queued: {durable.queued}")
+        elif phase == "collect":
+            typer.echo("Summary")
+            _print_collection_summary(
+                collection_progress, monotonic() - started, interrupted=True
+            )
+        else:
+            typer.echo(f"Interrupted during {phase}.")
+        raise typer.Exit(130) from error
+
+    typer.echo("Summary")
+    _print_collection_summary(collection_progress, monotonic() - started)
+    if collection_progress.failed:
+        raise typer.Exit(1)
+
+
 def _consume_collection_jobs(
     database: Database,
     pipeline: CatalogPipeline,
