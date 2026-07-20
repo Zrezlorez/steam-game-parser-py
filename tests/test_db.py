@@ -95,9 +95,132 @@ EXPECTED_COLUMNS = {
     ],
 }
 
+EXPECTED_TABLE_INFO = {
+    "games": [
+        ("appid", "INTEGER", 0, None, 1),
+        ("name", "TEXT", 1, None, 0),
+        ("type", "TEXT", 0, None, 0),
+        ("is_released", "INTEGER", 0, None, 0),
+        ("release_date", "TEXT", 0, None, 0),
+        ("coming_soon", "INTEGER", 0, None, 0),
+        ("short_description_html", "TEXT", 0, None, 0),
+        ("short_description_text", "TEXT", 0, None, 0),
+        ("detailed_description_html", "TEXT", 0, None, 0),
+        ("detailed_description_text", "TEXT", 0, None, 0),
+        ("about_the_game_html", "TEXT", 0, None, 0),
+        ("about_the_game_text", "TEXT", 0, None, 0),
+        ("developers_json", "TEXT", 0, None, 0),
+        ("publishers_json", "TEXT", 0, None, 0),
+        ("languages_json", "TEXT", 0, None, 0),
+        ("platforms_json", "TEXT", 0, None, 0),
+        ("categories_json", "TEXT", 0, None, 0),
+        ("genres_json", "TEXT", 0, None, 0),
+        ("header_image_url", "TEXT", 0, None, 0),
+        ("screenshots_json", "TEXT", 0, None, 0),
+        ("price_json", "TEXT", 0, None, 0),
+        ("steamspy_positive", "INTEGER", 0, None, 0),
+        ("steamspy_negative", "INTEGER", 0, None, 0),
+        ("steam_total_positive", "INTEGER", 0, None, 0),
+        ("steam_total_negative", "INTEGER", 0, None, 0),
+        ("steam_total_reviews", "INTEGER", 0, None, 0),
+        ("review_score", "INTEGER", 0, None, 0),
+        ("review_score_desc", "TEXT", 0, None, 0),
+        ("eligibility_status", "TEXT", 1, "'pending'", 0),
+        ("skip_reason", "TEXT", 0, None, 0),
+        ("metadata_fetched_at", "TEXT", 0, None, 0),
+        ("reviews_fetched_at", "TEXT", 0, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
+    ],
+    "user_library": [
+        ("appid", "INTEGER", 0, None, 1),
+        ("name_at_import", "TEXT", 1, None, 0),
+        ("playtime_forever_minutes", "INTEGER", 1, None, 0),
+        ("playtime_2weeks_minutes", "INTEGER", 0, None, 0),
+        ("last_played_at", "TEXT", 0, None, 0),
+        ("platform_playtime_json", "TEXT", 0, None, 0),
+        ("source_payload_json", "TEXT", 1, None, 0),
+        ("imported_at", "TEXT", 1, None, 0),
+    ],
+    "reviews": [
+        ("recommendation_id", "TEXT", 0, None, 1),
+        ("appid", "INTEGER", 1, None, 0),
+        ("language", "TEXT", 0, None, 0),
+        ("review_text", "TEXT", 1, None, 0),
+        ("voted_up", "INTEGER", 1, None, 0),
+        ("votes_up", "INTEGER", 0, None, 0),
+        ("votes_funny", "INTEGER", 0, None, 0),
+        ("weighted_vote_score", "REAL", 0, None, 0),
+        ("comment_count", "INTEGER", 0, None, 0),
+        ("steam_purchase", "INTEGER", 0, None, 0),
+        ("received_for_free", "INTEGER", 0, None, 0),
+        ("written_during_early_access", "INTEGER", 0, None, 0),
+        ("author_steamid", "TEXT", 0, None, 0),
+        ("author_playtime_forever", "INTEGER", 0, None, 0),
+        ("author_playtime_at_review", "INTEGER", 0, None, 0),
+        ("created_at", "TEXT", 0, None, 0),
+        ("updated_at", "TEXT", 0, None, 0),
+        ("fetched_at", "TEXT", 1, None, 0),
+    ],
+    "review_samples": [
+        ("appid", "INTEGER", 1, None, 1),
+        ("recommendation_id", "TEXT", 1, None, 2),
+        ("sample_kind", "TEXT", 1, None, 3),
+        ("sample_rank", "INTEGER", 1, None, 0),
+    ],
+    "source_items": [
+        ("source", "TEXT", 1, None, 1),
+        ("appid", "INTEGER", 1, None, 2),
+        ("source_page", "INTEGER", 0, None, 0),
+        ("payload_json", "TEXT", 1, None, 0),
+        ("fetched_at", "TEXT", 1, None, 0),
+    ],
+    "sync_jobs": [
+        ("job_kind", "TEXT", 1, None, 1),
+        ("item_key", "TEXT", 1, None, 2),
+        ("status", "TEXT", 1, None, 0),
+        ("attempt_count", "INTEGER", 1, "0", 0),
+        ("next_attempt_at", "TEXT", 0, None, 0),
+        ("last_error", "TEXT", 0, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
+    ],
+    "http_cache": [
+        ("cache_key", "TEXT", 0, None, 1),
+        ("url", "TEXT", 1, None, 0),
+        ("status_code", "INTEGER", 1, None, 0),
+        ("response_body", "TEXT", 1, None, 0),
+        ("etag", "TEXT", 0, None, 0),
+        ("last_modified", "TEXT", 0, None, 0),
+        ("fetched_at", "TEXT", 1, None, 0),
+        ("expires_at", "TEXT", 1, None, 0),
+    ],
+    "schema_version": [("version", "INTEGER", 1, None, 0)],
+    "game_search": [
+        ("name", "", 0, None, 0),
+        ("short_description_text", "", 0, None, 0),
+        ("detailed_description_text", "", 0, None, 0),
+        ("about_the_game_text", "", 0, None, 0),
+        ("developers", "", 0, None, 0),
+        ("publishers", "", 0, None, 0),
+        ("genres", "", 0, None, 0),
+        ("categories", "", 0, None, 0),
+    ],
+    "review_search": [
+        ("appid", "", 0, None, 0),
+        ("recommendation_id", "", 0, None, 0),
+        ("review_text", "", 0, None, 0),
+    ],
+}
+
 
 def _column_names(db: Database, table: str) -> list[str]:
     return [row["name"] for row in db.connection.execute(f"PRAGMA table_info({table})")]
+
+
+def _table_info(db: Database, table: str) -> list[tuple[object, ...]]:
+    return [
+        (row["name"], row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in db.connection.execute(f"PRAGMA table_info({table})")
+    ]
 
 
 def _primary_key_columns(db: Database, table: str) -> list[str]:
@@ -170,6 +293,11 @@ def test_schema_uses_exact_approved_columns(initialized_db):
         "recommendation_id",
         "review_text",
     ]
+
+
+def test_schema_declares_exact_column_metadata(initialized_db):
+    for table, expected in EXPECTED_TABLE_INFO.items():
+        assert _table_info(initialized_db, table) == expected
 
 
 def test_schema_uses_approved_keys_and_foreign_keys(initialized_db):
@@ -307,6 +435,33 @@ def test_upsert_game_updates_fts_row_in_the_same_transaction(initialized_db):
             "SELECT COUNT(*) FROM game_search WHERE game_search MATCH 'experiment'"
         ).fetchone()[0]
         == 1
+    )
+    assert (
+        initialized_db.connection.execute(
+            "SELECT COUNT(*) FROM game_search "
+            "WHERE game_search MATCH 'detailed_description_text:technology'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        initialized_db.connection.execute(
+            "SELECT COUNT(*) FROM game_search WHERE game_search MATCH 'name:technology'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        initialized_db.connection.execute(
+            "SELECT COUNT(*) FROM game_search "
+            "WHERE game_search MATCH 'short_description_text:technology'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        initialized_db.connection.execute(
+            "SELECT COUNT(*) FROM game_search "
+            "WHERE game_search MATCH 'about_the_game_text:technology'"
+        ).fetchone()[0]
+        == 0
     )
 
 
