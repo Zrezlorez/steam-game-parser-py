@@ -1,7 +1,8 @@
 {
   "success": 1,
   "query_summary": {
-    "num_reviews": 20,
+    "num_reviews": 1,
+    "total_reviews": 20,
     "total_positive": 12,
     "total_negative": 8,
     "review_score": 8,

@@ -20,6 +20,20 @@ def test_normalize_html_removes_script_and_style_content():
     ) == ("Mine\nBuild")
 
 
+def test_normalize_html_collapses_unicode_whitespace():
+    assert normalize_html("<p>Build&nbsp;and\u2003improve</p>") == "Build and improve"
+
+
+def test_normalize_html_preserves_boundaries_around_suppressed_content_and_table_cells():
+    assert (
+        normalize_html(
+            "Build<script>bad()</script><style>bad{}</style>faster"
+            "<table><tr><td>One</td><td>Two</td></tr></table>"
+        )
+        == "Build faster\nOne\nTwo"
+    )
+
+
 def test_parse_app_details_keeps_html_and_search_text(load_fixture):
     details = parse_app_details(10, load_fixture("steam_appdetails.json"))
 
@@ -49,6 +63,9 @@ def test_parse_app_details_returns_none_for_missing_app_and_rejects_malformed_re
     with pytest.raises(ValueError, match="app details"):
         parse_app_details(10, {"10": {"success": True, "data": []}})
 
+    with pytest.raises(ValueError, match="app details"):
+        parse_app_details(10, {"10": {"success": True, "data": {}}})
+
 
 def test_parse_review_page_reads_aggregate_and_author_fields(load_fixture):
     page = parse_review_page(10, load_fixture("steam_reviews.json"))
@@ -65,6 +82,37 @@ def test_parse_review_page_reads_aggregate_and_author_fields(load_fixture):
     assert page.reviews[0].weighted_vote_score == 0.9
     assert page.reviews[0].created_at == "2026-07-20T00:00:00+00:00"
     assert page.reviews[0].updated_at == "2026-07-21T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (field, value)
+        for field in ("total_reviews", "total_positive", "total_negative")
+        for value in (None, True, 1.0, "1", -1)
+    ],
+)
+def test_parse_review_page_rejects_corrupt_aggregate_fields(field, value):
+    summary = {"total_reviews": 1, "total_positive": 1, "total_negative": 1}
+    if value is None:
+        del summary[field]
+    else:
+        summary[field] = value
+
+    with pytest.raises(ValueError, match="Steam reviews"):
+        parse_review_page(10, {"success": 1, "query_summary": summary, "reviews": []})
+
+
+def test_parse_review_page_rejects_unsuccessful_response():
+    with pytest.raises(ValueError, match="Steam reviews"):
+        parse_review_page(
+            10,
+            {
+                "success": 0,
+                "query_summary": {"total_reviews": 0, "total_positive": 0, "total_negative": 0},
+                "reviews": [],
+            },
+        )
 
 
 def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
@@ -101,7 +149,13 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
         ),
         (
             "https://store.steampowered.com/appreviews/10",
-            {"filter": "recent", "review_type": "positive", "num_per_page": "5", "language": "all"},
+            {
+                "filter": "recent",
+                "review_type": "positive",
+                "num_per_page": "5",
+                "language": "all",
+                "json": "1",
+            },
             timedelta(days=1),
             "steam",
         ),

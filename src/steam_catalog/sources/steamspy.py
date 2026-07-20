@@ -41,12 +41,17 @@ def parse_catalog_page(payload: Mapping[str, Any]) -> list[DiscoveryItem]:
         appid = _positive_appid(source_item.get("appid"))
         if appid is None:
             continue
+        positive = _review_count(source_item.get("positive"))
+        negative = _review_count(source_item.get("negative"))
         items.append(
             DiscoveryItem(
                 appid=appid,
                 name=_string_or_empty(source_item.get("name")),
-                provisional_reviews=_review_count(source_item.get("positive"))
-                + _review_count(source_item.get("negative")),
+                steamspy_positive=positive,
+                steamspy_negative=negative,
+                provisional_reviews=positive + negative
+                if positive is not None and negative is not None
+                else None,
                 payload_json=_compact_json(source_item),
             )
         )
@@ -64,14 +69,14 @@ def _positive_appid(value: object) -> int | None:
     return None
 
 
-def _review_count(value: object) -> int:
+def _review_count(value: object) -> int | None:
     if isinstance(value, bool):
-        return 0
+        return None
     if isinstance(value, int):
-        return max(value, 0)
+        return value if value >= 0 else None
     if isinstance(value, str) and _BASE_10_INTEGER.fullmatch(value):
         return int(value)
-    return 0
+    return None
 
 
 def _string_or_empty(value: object) -> str:

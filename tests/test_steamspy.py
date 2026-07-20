@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from datetime import timedelta
 
 from steam_catalog.sources.steamspy import SteamSpyClient, parse_catalog_page
@@ -6,7 +7,24 @@ from steam_catalog.sources.steamspy import SteamSpyClient, parse_catalog_page
 def test_parse_catalog_page_calculates_provisional_review_count(load_fixture):
     items = parse_catalog_page(load_fixture("steamspy_page.json"))
 
-    assert [(item.appid, item.provisional_reviews) for item in items] == [(10, 20), (11, 19)]
+    assert [asdict(item) for item in items] == [
+        {
+            "appid": 10,
+            "name": "Drill Builder",
+            "steamspy_positive": 12,
+            "steamspy_negative": 8,
+            "provisional_reviews": 20,
+            "payload_json": '{"appid":10,"name":"Drill Builder","negative":8,"positive":12}',
+        },
+        {
+            "appid": 11,
+            "name": "Small Builder",
+            "steamspy_positive": 10,
+            "steamspy_negative": 9,
+            "provisional_reviews": 19,
+            "payload_json": '{"appid":"11","name":"Small Builder","negative":9,"positive":10}',
+        },
+    ]
 
 
 def test_parse_catalog_page_rejects_invalid_ids_and_preserves_compact_payloads():

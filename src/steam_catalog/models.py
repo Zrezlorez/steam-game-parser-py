@@ -23,6 +23,8 @@ class DiscoveryItem:
 
     appid: int
     name: str = ""
+    steamspy_positive: int | None = None
+    steamspy_negative: int | None = None
     provisional_reviews: int | None = None
     payload_json: str = "{}"
 

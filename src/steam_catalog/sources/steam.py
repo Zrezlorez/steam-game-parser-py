@@ -16,7 +16,7 @@ APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
 REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 METADATA_CACHE_TTL = timedelta(days=7)
 REVIEWS_CACHE_TTL = timedelta(days=1)
-_WHITESPACE = re.compile(r"[ \t\r\f\v]+")
+_WHITESPACE = re.compile(r"\s+")
 _BLOCK_TAGS = frozenset(
     {
         "address",
@@ -40,6 +40,8 @@ _BLOCK_TAGS = frozenset(
         "pre",
         "section",
         "table",
+        "td",
+        "th",
         "tr",
         "ul",
     }
@@ -78,6 +80,7 @@ class SteamClient:
                 "review_type": review_type,
                 "num_per_page": str(limit),
                 "language": "all",
+                "json": "1",
             },
             cache_ttl=REVIEWS_CACHE_TTL,
             rate_bucket="steam",
@@ -95,13 +98,19 @@ class _TextExtractor(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style"}:
+            if not self.hidden_depth:
+                self._space()
             self.hidden_depth += 1
+            return
         if tag in _BLOCK_TAGS and not self.hidden_depth:
             self._newline()
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style"} and self.hidden_depth:
             self.hidden_depth -= 1
+            if not self.hidden_depth:
+                self._space()
+            return
         if tag in _BLOCK_TAGS and not self.hidden_depth:
             self._newline()
 
@@ -112,6 +121,10 @@ class _TextExtractor(HTMLParser):
     def _newline(self) -> None:
         if self.parts and self.parts[-1] != "\n":
             self.parts.append("\n")
+
+    def _space(self) -> None:
+        if self.parts and not self.parts[-1].isspace():
+            self.parts.append(" ")
 
 
 def normalize_html(value: str) -> str:
@@ -154,6 +167,9 @@ def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | N
     if response.get("success") is not True or not isinstance(response.get("data"), Mapping):
         raise ValueError("Steam app details response is malformed")
     data = response["data"]
+    name = data.get("name")
+    if not isinstance(name, str):
+        raise ValueError("Steam app details response is malformed")
     release_data = data.get("release_date")
     if release_data is not None and not isinstance(release_data, Mapping):
         raise ValueError("Steam app details response is malformed")
@@ -164,7 +180,7 @@ def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | N
     about_html = _optional_string(data.get("about_the_game"))
     return GameDetails(
         appid=appid,
-        name=_optional_string(data.get("name")) or "",
+        name=name,
         type=_optional_string(data.get("type")),
         is_released=not coming_soon if coming_soon is not None else None,
         release_date=release_date,
@@ -191,7 +207,11 @@ def parse_review_page(appid: int, payload: Mapping[str, Any]) -> ReviewPage:
     """Parse Steam aggregate review data and valid review records."""
     summary = payload.get("query_summary")
     source_reviews = payload.get("reviews")
-    if not isinstance(summary, Mapping) or not isinstance(source_reviews, list):
+    if (
+        payload.get("success") != 1
+        or not isinstance(summary, Mapping)
+        or not isinstance(source_reviews, list)
+    ):
         raise ValueError("Steam reviews response is malformed")
     reviews = tuple(
         parsed
@@ -200,9 +220,9 @@ def parse_review_page(appid: int, payload: Mapping[str, Any]) -> ReviewPage:
         if (parsed := _parse_review(appid, source_review)) is not None
     )
     return ReviewPage(
-        total_reviews=_integer_or_default(summary.get("num_reviews")),
-        total_positive=_integer_or_default(summary.get("total_positive")),
-        total_negative=_integer_or_default(summary.get("total_negative")),
+        total_reviews=_required_nonnegative_integer(summary.get("total_reviews")),
+        total_positive=_required_nonnegative_integer(summary.get("total_positive")),
+        total_negative=_required_nonnegative_integer(summary.get("total_negative")),
         review_score=_optional_integer(summary.get("review_score")),
         review_score_desc=_optional_string(summary.get("review_score_desc")),
         reviews=reviews,
@@ -261,8 +281,10 @@ def _optional_integer(value: object) -> int | None:
     return None
 
 
-def _integer_or_default(value: object) -> int:
-    return _optional_integer(value) or 0
+def _required_nonnegative_integer(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ValueError("Steam reviews response is malformed")
 
 
 def _optional_float(value: object) -> float | None:
