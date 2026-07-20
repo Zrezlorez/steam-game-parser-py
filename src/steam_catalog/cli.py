@@ -20,7 +20,7 @@ from steam_catalog.db import Database
 from steam_catalog.exporters import export_csv, export_jsonl
 from steam_catalog.http import CachedHttpClient
 from steam_catalog.importers.library import import_library
-from steam_catalog.pipeline import CatalogPipeline, RunStats
+from steam_catalog.pipeline import BootstrapProgressEvent, CatalogPipeline, RunStats
 from steam_catalog.sources.steam import SteamClient
 from steam_catalog.sources.steamspy import SteamSpyClient
 
@@ -107,6 +107,18 @@ def _print_collection_summary(
         f"Saved: {progress.saved}; Skipped: {progress.skipped}; "
         f"Retrying: {progress.retrying}; Permanent failures: {progress.permanent_failures}; "
         f"Elapsed: {elapsed_seconds:.1f}s"
+    )
+
+
+def _print_bootstrap_event(event: BootstrapProgressEvent) -> None:
+    page = "Steam app list" if event.source_page is None else f"Discovery page {event.source_page}"
+    if event.stage == "fetching":
+        typer.echo(f"{page}: fetching...")
+        return
+    typer.echo(
+        f"{page}: saved, discovered={event.discovered}, queued={event.queued}, "
+        f"total_discovered={event.total_discovered}, total_queued={event.total_queued}, "
+        f"{event.elapsed_seconds:.1f}s"
     )
 
 
@@ -197,7 +209,10 @@ def bootstrap_command(
             with _pipeline(database, settings) as active_pipeline:
                 pipeline = active_pipeline
                 stats = active_pipeline.bootstrap(
-                    source.value, resume=resume, page_limit=page_limit
+                    source.value,
+                    resume=resume,
+                    page_limit=page_limit,
+                    on_progress=_print_bootstrap_event,
                 )
     except KeyboardInterrupt as error:
         progress = getattr(pipeline, "bootstrap_progress", stats)
@@ -244,7 +259,10 @@ def run_command(
             with _pipeline(database, settings) as pipeline:
                 active_pipeline = pipeline
                 bootstrap_stats = pipeline.bootstrap(
-                    source.value, resume=resume, page_limit=page_limit
+                    source.value,
+                    resume=resume,
+                    page_limit=page_limit,
+                    on_progress=_print_bootstrap_event,
                 )
                 typer.echo(f"Discovered: {bootstrap_stats.discovered}")
                 typer.echo(f"Queued: {bootstrap_stats.queued}")

@@ -1,7 +1,9 @@
 """Resumable discovery and verified eligibility collection."""
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Literal, Protocol, TypeAlias, cast
 
 from steam_catalog.db import Database
@@ -61,6 +63,17 @@ class RunStats:
 
 
 @dataclass(frozen=True)
+class BootstrapProgressEvent:
+    stage: Literal["fetching", "saved"]
+    source_page: int | None
+    discovered: int = 0
+    queued: int = 0
+    total_discovered: int = 0
+    total_queued: int = 0
+    elapsed_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
 class CollectionResult:
     appid: int
     status: str
@@ -97,6 +110,7 @@ class CatalogPipeline:
         *,
         resume: bool = True,
         page_limit: int | None = None,
+        on_progress: Callable[[BootstrapProgressEvent], None] | None = None,
     ) -> RunStats:
         """Discover candidates and queue only those passing provisional checks."""
         if page_limit is not None and page_limit < 0:
@@ -104,7 +118,9 @@ class CatalogPipeline:
 
         self._bootstrap_discovered_appids.clear()
         self._bootstrap_queued_appids.clear()
-        for source_page, items in self._discovery_pages(source, resume, page_limit):
+        for source_page, items, started in self._discovery_pages(
+            source, resume, page_limit, on_progress
+        ):
             timestamp = _utc_now()
             page_discovered_appids: set[int] = set()
             page_queued_appids: set[int] = set()
@@ -157,6 +173,20 @@ class CatalogPipeline:
                                 updated_at=timestamp,
                             )
                         page_queued_appids.add(candidate.appid)
+
+            if on_progress is not None:
+                totals = self.bootstrap_progress
+                on_progress(
+                    BootstrapProgressEvent(
+                        stage="saved",
+                        source_page=source_page,
+                        discovered=len(page_discovered_appids),
+                        queued=len(page_queued_appids),
+                        total_discovered=totals.discovered,
+                        total_queued=totals.queued,
+                        elapsed_seconds=monotonic() - started,
+                    )
+                )
 
         return self.bootstrap_progress
 
@@ -292,10 +322,14 @@ class CatalogPipeline:
         source: str,
         resume: bool,
         page_limit: int | None,
+        on_progress: Callable[[BootstrapProgressEvent], None] | None,
     ):
         if source == "steam":
             if page_limit != 0:
-                yield None, self.steam.fetch_app_list()
+                if on_progress is not None:
+                    on_progress(BootstrapProgressEvent(stage="fetching", source_page=None))
+                started = monotonic()
+                yield None, self.steam.fetch_app_list(), started
             return
         if source != "steamspy":
             raise ValueError(f"Unsupported discovery source: {source}")
@@ -303,11 +337,14 @@ class CatalogPipeline:
         page = self.database.next_source_page(source) if resume else 0
         fetched = 0
         while page_limit is None or fetched < page_limit:
+            if on_progress is not None:
+                on_progress(BootstrapProgressEvent(stage="fetching", source_page=page))
+            started = monotonic()
             items = self.steamspy.fetch_page(page)
             fetched += 1
             if not items:
                 return
-            yield page, items
+            yield page, items, started
             page += 1
 
 

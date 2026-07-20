@@ -495,6 +495,27 @@ def test_bootstrap_page_rolls_back_as_one_resumable_unit(pipeline_factory, monke
     assert pipeline.bootstrap_progress == RunStats()
 
 
+def test_bootstrap_reports_fetching_and_post_commit_page_progress(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20), item(11, 19)]])
+    events = []
+
+    def observe(event):
+        if event.stage == "saved":
+            assert db.job_status("collect", "10") == "pending"
+            assert db.game_status(11) == "below_provisional_threshold"
+        events.append(event)
+
+    pipeline.bootstrap("steamspy", page_limit=1, on_progress=observe)
+
+    assert [event.stage for event in events] == ["fetching", "saved"]
+    assert events[0].source_page == 0
+    assert events[1].source_page == 0
+    assert events[1].discovered == 2
+    assert events[1].queued == 1
+    assert events[1].total_discovered == 2
+    assert events[1].total_queued == 1
+
+
 def test_bootstrap_interrupt_after_page_commit_publishes_full_progress(
     pipeline_factory, monkeypatch
 ):

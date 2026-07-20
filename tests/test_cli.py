@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -247,7 +248,9 @@ def test_import_library_and_export_are_wired_offline(tmp_path: Path):
 
 def test_bootstrap_delegates_without_printing_payloads(tmp_path: Path, monkeypatch):
     class FakePipeline:
-        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+        def bootstrap(
+            self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+        ):
             assert (source, resume, page_limit) == ("steamspy", True, 2)
             return RunStats(discovered=3, queued=2)
 
@@ -287,7 +290,9 @@ def test_run_orchestrates_all_phases_and_forwards_options(tmp_path: Path, monkey
         class FakePipeline:
             bootstrap_progress = RunStats()
 
-            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            def bootstrap(
+                self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+            ):
                 observed.append((source, resume, page_limit))
                 return RunStats(discovered=1, queued=0)
 
@@ -323,7 +328,9 @@ def test_run_without_library_omits_import_phase(tmp_path: Path, monkeypatch):
     @contextmanager
     def fake_pipeline(database, settings):
         class FakePipeline:
-            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            def bootstrap(
+                self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+            ):
                 return RunStats()
 
         yield FakePipeline()
@@ -339,6 +346,49 @@ def test_run_without_library_omits_import_phase(tmp_path: Path, monkeypatch):
     assert "Import library" not in result.stdout
 
 
+def test_run_prints_discovery_page_progress(tmp_path: Path, monkeypatch):
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class FakePipeline:
+            def bootstrap(
+                self,
+                source: str,
+                *,
+                resume: bool,
+                page_limit: int | None,
+                on_progress,
+            ):
+                on_progress(SimpleNamespace(stage="fetching", source_page=4))
+                on_progress(
+                    SimpleNamespace(
+                        stage="saved",
+                        source_page=4,
+                        discovered=1000,
+                        queued=734,
+                        total_discovered=5000,
+                        total_queued=4465,
+                        elapsed_seconds=1.25,
+                    )
+                )
+                return RunStats(discovered=1000, queued=734)
+
+        yield FakePipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "run", "--page-limit", "1"],
+    )
+
+    assert result.exit_code == 0
+    assert "Discovery page 4: fetching..." in result.stdout
+    assert (
+        "Discovery page 4: saved, discovered=1000, queued=734, "
+        "total_discovered=5000, total_queued=4465, 1.2s" in result.stdout
+    )
+
+
 def test_run_interrupt_releases_active_collection_job(tmp_path: Path, monkeypatch):
     path = tmp_path / "run-interrupt.sqlite3"
     database = _open_database(path)
@@ -350,7 +400,9 @@ def test_run_interrupt_releases_active_collection_job(tmp_path: Path, monkeypatc
         class InterruptingPipeline:
             bootstrap_progress = RunStats()
 
-            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            def bootstrap(
+                self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+            ):
                 return RunStats()
 
             def collect_one(self, appid: int, *, lease_token: str | None = None):
@@ -375,7 +427,9 @@ def test_run_interrupt_releases_active_collection_job(tmp_path: Path, monkeypatc
 
 def test_bootstrap_keyboard_interrupt_reports_progress_and_exits_130(tmp_path: Path, monkeypatch):
     class InterruptingPipeline:
-        def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+        def bootstrap(
+            self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+        ):
             raise KeyboardInterrupt
 
     @contextmanager
@@ -416,7 +470,9 @@ def test_bootstrap_interrupt_reports_current_run_deltas_not_historical_totals(
         class InterruptingPipeline:
             bootstrap_progress = RunStats()
 
-            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+            def bootstrap(
+                self, source: str, *, resume: bool, page_limit: int | None, on_progress=None
+            ):
                 database.upsert_source_item(
                     source,
                     DiscoveryItem(appid=4, name="Current", payload_json='{"appid":4}'),
