@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 import json
 import random
 import time
@@ -56,7 +57,7 @@ class CachedHttpClient:
     ) -> dict[str, Any]:
         """Return a cached or fetched JSON object for a GET request."""
         normalized_url, cache_key = self._normalized_url_and_key(url, params)
-        ttl = cache_ttl or timedelta(hours=self.settings.cache_ttl_hours)
+        ttl = cache_ttl if cache_ttl is not None else timedelta(hours=self.settings.cache_ttl_hours)
         cached = self.database.get_http_cache(cache_key)
         now = self._now()
         if cached is not None and self._parse_datetime(cached["expires_at"]) > now:
@@ -176,7 +177,14 @@ class CachedHttpClient:
             try:
                 return max(0.0, float(retry_after))
             except ValueError:
-                pass
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=UTC)
+                    return max(0.0, (retry_at - self._now()).total_seconds())
         return self._backoff(attempt)
 
     @staticmethod

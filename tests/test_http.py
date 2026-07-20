@@ -61,6 +61,23 @@ def test_expired_entry_uses_conditional_headers_before_revalidation(http_client_
     assert requests[1].headers["if-modified-since"] == "Sun, 20 Jul 2025 00:00:00 GMT"
 
 
+def test_zero_cache_ttl_revalidates_on_second_request(http_client_factory):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, json={"ok": True}, headers={"ETag": '"version-1"'})
+        return httpx.Response(304)
+
+    client = http_client_factory(handler)
+
+    assert client.get_json("https://example.test/data", cache_ttl=timedelta(0)) == {"ok": True}
+    assert client.get_json("https://example.test/data", cache_ttl=timedelta(0)) == {"ok": True}
+    assert len(requests) == 2
+    assert requests[1].headers["if-none-match"] == '"version-1"'
+
+
 def test_429_uses_retry_after_before_retrying(http_client_factory):
     responses = iter(
         [
@@ -73,6 +90,25 @@ def test_429_uses_retry_after_before_retrying(http_client_factory):
 
     assert client.get_json("https://example.test/data") == {"ok": True}
     assert sleeps == [3.0]
+
+
+def test_429_uses_http_date_retry_after_relative_to_injected_clock(http_client_factory):
+    now = datetime(2026, 7, 20, 0, 0, 0, tzinfo=UTC)
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "Mon, 20 Jul 2026 00:00:05 GMT"}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    sleeps: list[float] = []
+    client = http_client_factory(
+        lambda request: next(responses),
+        clock=lambda: now,
+        sleep=sleeps.append,
+    )
+
+    assert client.get_json("https://example.test/data") == {"ok": True}
+    assert sleeps == [5.0]
 
 
 def test_server_errors_retry_with_exponential_backoff(http_client_factory):
