@@ -114,6 +114,9 @@ class CatalogPipeline:
                             skip_reason="below_provisional_threshold",
                             updated_at=timestamp,
                         )
+                        self.database.replace_review_samples(
+                            candidate.appid, {}, fetched_at=timestamp
+                        )
                         self.database.discard_job("collect", str(candidate.appid))
                         continue
 
@@ -154,6 +157,7 @@ class CatalogPipeline:
                     replace_steam_aggregate=True,
                     **aggregate,
                 )
+                self.database.replace_review_samples(appid, {}, fetched_at=timestamp)
                 self._complete_job(appid, lease_token, timestamp)
             return CollectionResult(appid, "below_verified_threshold", "below_verified_threshold")
 
@@ -218,6 +222,7 @@ class CatalogPipeline:
                 )
             else:
                 self._store_details(details, "ineligible", reason, timestamp, aggregate)
+            self.database.replace_review_samples(appid, {}, fetched_at=timestamp)
             self._complete_job(appid, lease_token, timestamp)
         return CollectionResult(appid, "ineligible", reason)
 

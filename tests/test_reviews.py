@@ -209,3 +209,57 @@ def test_same_review_is_stored_once_but_can_have_multiple_sample_kinds(
         ("helpful_positive", 1),
         ("recent_positive", 1),
     ]
+
+
+def test_replace_review_samples_removes_unreferenced_reviews_and_search_rows(initialized_db):
+    initialized_db.upsert_game(
+        appid=10,
+        name="Sample Game",
+        eligibility_status="eligible",
+        updated_at="2026-07-20T00:00:00Z",
+    )
+    old_review = Review(
+        recommendation_id="old",
+        appid=10,
+        review_text="obsolete sample text",
+        voted_up=True,
+    )
+    new_review = replace(
+        old_review,
+        recommendation_id="new",
+        review_text="replacement sample text",
+    )
+    initialized_db.replace_review_samples(
+        10,
+        {"helpful_positive": [old_review]},
+        fetched_at="2026-07-20T00:01:00Z",
+    )
+
+    initialized_db.replace_review_samples(
+        10,
+        {"helpful_positive": [new_review]},
+        fetched_at="2026-07-20T00:02:00Z",
+    )
+
+    review_ids = initialized_db.connection.execute(
+        "SELECT recommendation_id FROM reviews ORDER BY recommendation_id"
+    ).fetchall()
+    assert [row["recommendation_id"] for row in review_ids] == ["new"]
+    assert initialized_db.search_reviews("obsolete", 10) == []
+    assert (
+        initialized_db.connection.execute(
+            "SELECT COUNT(*) FROM review_search WHERE review_search MATCH 'obsolete'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        initialized_db.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM reviews
+            LEFT JOIN review_samples USING(recommendation_id)
+            WHERE review_samples.recommendation_id IS NULL
+            """
+        ).fetchone()[0]
+        == 0
+    )

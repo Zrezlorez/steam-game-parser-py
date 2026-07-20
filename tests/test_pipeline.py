@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from steam_catalog.db import Database
-from steam_catalog.models import DiscoveryItem, GameDetails, ReviewPage
+from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
 from steam_catalog.pipeline import CatalogPipeline
 
 
@@ -37,6 +37,7 @@ class FakeSteamClient:
         review_total: int,
         app_type: str,
         coming_soon: bool,
+        app_available: bool,
         app_list: list[DiscoveryItem] | None = None,
     ) -> None:
         self.review_page = ReviewPage(
@@ -50,6 +51,7 @@ class FakeSteamClient:
             coming_soon=coming_soon,
         )
         self.app_list = app_list or []
+        self.app_available = app_available
         self.calls: list[tuple[object, ...]] = []
 
     def fetch_app_list(self) -> list[DiscoveryItem]:
@@ -60,8 +62,10 @@ class FakeSteamClient:
         self.calls.append(("reviews", appid, filter, review_type, limit))
         return self.review_page
 
-    def fetch_app_details(self, appid: int) -> GameDetails:
+    def fetch_app_details(self, appid: int) -> GameDetails | None:
         self.calls.append(("details", appid))
+        if not self.app_available:
+            return None
         return replace(self.details, appid=appid)
 
 
@@ -75,6 +79,7 @@ def pipeline_factory(tmp_path):
         review_total: int = 20,
         app_type: str = "game",
         coming_soon: bool = False,
+        app_available: bool = True,
         app_list: list[DiscoveryItem] | None = None,
     ) -> tuple[CatalogPipeline, Database]:
         database = Database(tmp_path / f"catalog-{len(databases)}.sqlite3")
@@ -86,6 +91,7 @@ def pipeline_factory(tmp_path):
                 review_total=review_total,
                 app_type=app_type,
                 coming_soon=coming_soon,
+                app_available=app_available,
                 app_list=app_list,
             ),
             steamspy=FakeSteamSpyClient(steamspy_pages or []),
@@ -417,6 +423,85 @@ def test_provisional_refresh_removes_stale_collect_job(pipeline_factory):
 
     assert db.game_status(10) == "below_provisional_threshold"
     assert db.job_status("collect", "10") is None
+
+
+def _store_old_sample(db: Database) -> None:
+    db.upsert_game(
+        appid=10,
+        name="Previously eligible",
+        eligibility_status="eligible",
+        updated_at="2026-07-20T00:00:00Z",
+    )
+    db.replace_review_samples(
+        10,
+        {
+            "helpful_positive": [
+                Review(
+                    recommendation_id="old",
+                    appid=10,
+                    review_text="old retained sample",
+                    voted_up=True,
+                )
+            ]
+        },
+        fetched_at="2026-07-20T00:00:01Z",
+    )
+
+
+@pytest.mark.parametrize(
+    ("pipeline_options", "expected_status"),
+    [
+        ({"review_total": 19}, "below_verified_threshold"),
+        ({"app_type": "dlc"}, "ineligible"),
+        ({"coming_soon": True}, "ineligible"),
+        ({"app_available": False}, "ineligible"),
+    ],
+)
+def test_eligible_refresh_to_ineligible_clears_review_samples(
+    pipeline_factory, pipeline_options, expected_status
+):
+    pipeline, db = pipeline_factory(**pipeline_options)
+    _store_old_sample(db)
+
+    result = pipeline.collect_one(10)
+
+    assert result.status == expected_status
+    assert db.review_count(10) == 0
+    assert db.search_reviews("retained", 10) == []
+
+
+def test_provisional_refresh_to_below_threshold_clears_review_samples(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 19)]])
+    _store_old_sample(db)
+
+    pipeline.bootstrap("steamspy", resume=False, page_limit=1)
+
+    assert db.game_status(10) == "below_provisional_threshold"
+    assert db.review_count(10) == 0
+    assert db.search_reviews("retained", 10) == []
+
+
+def test_stale_lease_rollback_preserves_previous_review_samples(pipeline_factory):
+    pipeline, db = pipeline_factory(review_total=19)
+    _store_old_sample(db)
+    db.enqueue_job("collect", "10")
+    stale_lease = db.claim_job("collect")
+    db.connection.execute("UPDATE sync_jobs SET status = 'pending' WHERE item_key = '10'")
+    current_lease = db.claim_job("collect")
+
+    with pytest.raises(RuntimeError, match="lease"):
+        pipeline.collect_one(10, lease_token=stale_lease["lease_token"])
+
+    samples = db.connection.execute(
+        "SELECT recommendation_id, sample_kind FROM review_samples"
+    ).fetchall()
+    assert [tuple(row) for row in samples] == [("old", "helpful_positive")]
+    assert [row["recommendation_id"] for row in db.search_reviews("retained", 10)] == ["old"]
+    assert db.game_status(10) == "eligible"
+    job = db.connection.execute(
+        "SELECT status, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(job) == ("running", current_lease["lease_token"])
 
 
 def test_claim_job_compares_equivalent_utc_timestamp_formats(initialized_db):

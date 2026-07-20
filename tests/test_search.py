@@ -1,4 +1,5 @@
 from dataclasses import replace
+import sqlite3
 
 import pytest
 
@@ -125,6 +126,19 @@ def test_game_search_snippet_uses_whole_token_match(db_with_game):
     assert result[0]["snippet"] == "Learn to <mark>drill</mark> deep underground"
 
 
+def test_game_search_highlights_diacritic_folded_text_in_matching_field(db_with_game):
+    db_with_game.add_game(
+        appid=10,
+        name="Career Builder",
+        short_description_text="Manage schedules",
+        detailed_description_text="Polish your résumé for every application",
+    )
+
+    result = db_with_game.search_games("resume", 10)
+
+    assert result[0]["snippet"] == "Polish your <mark>résumé</mark> for every application"
+
+
 def test_review_search_returns_game_and_sample_context(db_with_review):
     db_with_review.add_review(
         appid=10,
@@ -153,6 +167,72 @@ def test_review_search_refresh_removes_old_text(db_with_review):
     assert [row["recommendation_id"] for row in db_with_review.search_reviews("balanced", 10)] == [
         "r1"
     ]
+
+
+def test_review_search_highlights_diacritic_folded_original_text(db_with_review):
+    db_with_review.add_review(
+        appid=10,
+        recommendation_id="r1",
+        text="A thoughtful RÉSUMÉ of the entire campaign",
+    )
+
+    result = db_with_review.search_reviews("resume", 10)
+
+    assert result[0]["snippet"] == "A thoughtful <mark>RÉSUMÉ</mark> of the entire campaign"
+
+
+def test_review_search_batches_sample_context_for_ranked_rows(db_with_review):
+    db_with_review.add_review(
+        appid=10,
+        recommendation_id="r1",
+        text="Shared search phrase one",
+        sample_kinds=("helpful_negative", "recent_negative"),
+    )
+    db_with_review.add_review(
+        appid=20,
+        recommendation_id="r2",
+        text="Shared search phrase two",
+        sample_kinds=("helpful_negative",),
+    )
+    statements = []
+    db_with_review.connection.set_trace_callback(statements.append)
+    try:
+        assert db_with_review.search_reviews("absent", 10) == []
+        assert not [statement for statement in statements if "FROM review_samples" in statement]
+        statements.clear()
+
+        results = db_with_review.search_reviews("shared", 10)
+    finally:
+        db_with_review.connection.set_trace_callback(None)
+
+    membership_queries = [
+        statement for statement in statements if "FROM review_samples" in statement
+    ]
+    assert len(membership_queries) == 1
+    assert {row["recommendation_id"]: row["samples"] for row in results} == {
+        "r1": [
+            {"sample_kind": "helpful_negative", "sample_rank": 1},
+            {"sample_kind": "recent_negative", "sample_rank": 1},
+        ],
+        "r2": [{"sample_kind": "helpful_negative", "sample_rank": 1}],
+    }
+
+
+def test_review_search_chunks_sample_context_at_sqlite_parameter_limit(db_with_review):
+    for appid in range(10, 13):
+        db_with_review.add_review(
+            appid=appid,
+            recommendation_id=f"r{appid}",
+            text=f"Bounded query review {appid}",
+        )
+    previous_limit = db_with_review.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 2)
+    try:
+        results = db_with_review.search_reviews("bounded", 3)
+    finally:
+        db_with_review.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+    assert [row["recommendation_id"] for row in results] == ["r10", "r11", "r12"]
+    assert all(row["samples"] for row in results)
 
 
 @pytest.mark.parametrize("query", ["", "   ", "_", "!@#$%^&*()", '" OR name:* -'])

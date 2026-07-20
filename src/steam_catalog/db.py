@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import unicodedata
 
 from steam_catalog.models import DiscoveryItem, EligibilityStatus, Review
 
@@ -472,9 +473,16 @@ class Database:
                 unique_reviews.setdefault(review.recommendation_id, review)
 
         with self.transaction():
-            self.connection.execute("DELETE FROM review_samples WHERE appid = ?", (appid,))
+            old_review_ids = [
+                row["recommendation_id"]
+                for row in self.connection.execute(
+                    "SELECT DISTINCT recommendation_id FROM review_samples WHERE appid = ?",
+                    (appid,),
+                )
+            ]
             for review in unique_reviews.values():
                 self.upsert_review(**asdict(review), fetched_at=fetched_at)
+            self.connection.execute("DELETE FROM review_samples WHERE appid = ?", (appid,))
             for sample_kind, reviews in samples.items():
                 self.connection.executemany(
                     """
@@ -487,6 +495,17 @@ class Database:
                         for rank, review in enumerate(reviews, start=1)
                     ),
                 )
+            for recommendation_id in old_review_ids:
+                has_membership = self.connection.execute(
+                    "SELECT 1 FROM review_samples WHERE recommendation_id = ? LIMIT 1",
+                    (recommendation_id,),
+                ).fetchone()
+                if has_membership is None:
+                    self._delete_review_search_row(recommendation_id)
+                    self.connection.execute(
+                        "DELETE FROM reviews WHERE recommendation_id = ?",
+                        (recommendation_id,),
+                    )
 
     def get_http_cache(self, cache_key: str) -> sqlite3.Row | None:
         """Return the cached response for a canonical request key, if present."""
@@ -914,17 +933,32 @@ class Database:
             """,
             (match_query, limit),
         ).fetchall()
+        memberships_by_review: dict[str, list[dict[str, object]]] = {
+            row["recommendation_id"]: [] for row in rows
+        }
+        review_ids = tuple(memberships_by_review)
+        parameter_limit = max(1, self.connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        for offset in range(0, len(review_ids), parameter_limit):
+            chunk = review_ids[offset : offset + parameter_limit]
+            placeholders = ", ".join("?" for _ in chunk)
+            memberships = self.connection.execute(
+                f"""
+                SELECT recommendation_id, sample_kind, sample_rank
+                FROM review_samples
+                WHERE recommendation_id IN ({placeholders})
+                ORDER BY recommendation_id, sample_kind, sample_rank
+                """,
+                chunk,
+            ).fetchall()
+            for membership in memberships:
+                memberships_by_review[membership["recommendation_id"]].append(
+                    {
+                        "sample_kind": membership["sample_kind"],
+                        "sample_rank": membership["sample_rank"],
+                    }
+                )
         results = []
         for row in rows:
-            memberships = self.connection.execute(
-                """
-                SELECT sample_kind, sample_rank
-                FROM review_samples
-                WHERE appid = ? AND recommendation_id = ?
-                ORDER BY sample_kind, sample_rank
-                """,
-                (row["appid"], row["recommendation_id"]),
-            ).fetchall()
             results.append(
                 {
                     "appid": row["appid"],
@@ -932,13 +966,7 @@ class Database:
                     "recommendation_id": row["recommendation_id"],
                     "rank": row["rank"],
                     "snippet": _highlighted_snippet((row["review_text"],), tokens),
-                    "samples": [
-                        {
-                            "sample_kind": membership["sample_kind"],
-                            "sample_rank": membership["sample_rank"],
-                        }
-                        for membership in memberships
-                    ],
+                    "samples": memberships_by_review[row["recommendation_id"]],
                 }
             )
         return results
@@ -1026,26 +1054,73 @@ def _quoted_match_query(query: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _highlighted_snippet(values: Sequence[str | None], tokens: Sequence[str]) -> str:
+    normalized_tokens = tuple(
+        normalized for token in tokens if (normalized := _normalize_search_text(token)[0])
+    )
+    if not normalized_tokens:
+        return next((value[:_SNIPPET_CONTEXT] for value in values if value), "")
     token_pattern = re.compile(
-        rf"(?<!\w)(?:{'|'.join(re.escape(token) for token in tokens)})(?!\w)",
-        re.IGNORECASE,
+        rf"(?<!\w)(?:{'|'.join(re.escape(token) for token in normalized_tokens)})(?!\w)"
     )
-    text = next(
-        (value for value in values if value and token_pattern.search(value)),
-        next((value for value in values if value), ""),
-    )
-    match = token_pattern.search(text)
+    text = next((value for value in values if value), "")
+    normalized_text, source_spans = _normalize_search_text(text)
+    match = token_pattern.search(normalized_text)
+    for value in values:
+        if not value:
+            continue
+        candidate_text, candidate_spans = _normalize_search_text(value)
+        candidate_match = token_pattern.search(candidate_text)
+        if candidate_match is not None:
+            text = value
+            normalized_text = candidate_text
+            source_spans = candidate_spans
+            match = candidate_match
+            break
     if match is None:
         return text[:_SNIPPET_CONTEXT]
 
-    start = max(0, match.start() - _SNIPPET_CONTEXT)
-    end = min(len(text), match.end() + _SNIPPET_CONTEXT)
+    match_start = source_spans[match.start()][0]
+    match_end = source_spans[match.end() - 1][1]
+    start = max(0, match_start - _SNIPPET_CONTEXT)
+    end = min(len(text), match_end + _SNIPPET_CONTEXT)
     if start:
         next_space = text.find(" ", start)
-        start = next_space + 1 if next_space >= 0 and next_space < match.start() else start
+        start = next_space + 1 if next_space >= 0 and next_space < match_start else start
     if end < len(text):
-        previous_space = text.rfind(" ", match.end(), end)
-        end = previous_space if previous_space >= match.end() else end
-    fragment = text[start:end]
-    highlighted = token_pattern.sub(lambda found: f"<mark>{found.group(0)}</mark>", fragment)
+        previous_space = text.rfind(" ", match_end, end)
+        end = previous_space if previous_space >= match_end else end
+    ranges = [
+        (source_spans[found.start()][0], source_spans[found.end() - 1][1])
+        for found in token_pattern.finditer(normalized_text)
+        if source_spans[found.start()][0] < end and source_spans[found.end() - 1][1] > start
+    ]
+    highlighted_parts = []
+    cursor = start
+    for highlight_start, highlight_end in ranges:
+        if highlight_start < cursor:
+            continue
+        highlighted_parts.extend(
+            (text[cursor:highlight_start], "<mark>", text[highlight_start:highlight_end], "</mark>")
+        )
+        cursor = highlight_end
+    highlighted_parts.append(text[cursor:end])
+    highlighted = "".join(highlighted_parts)
     return f"{'... ' if start else ''}{highlighted}{' ...' if end < len(text) else ''}"
+
+
+def _normalize_search_text(text: str) -> tuple[str, tuple[tuple[int, int], ...]]:
+    normalized = []
+    source_spans: list[tuple[int, int]] = []
+    for source_index, source_character in enumerate(text):
+        folded = unicodedata.normalize("NFKD", source_character.casefold())
+        stripped = "".join(
+            character for character in folded if not unicodedata.combining(character)
+        )
+        if not stripped:
+            if source_spans and unicodedata.category(source_character).startswith("M"):
+                source_start, _ = source_spans[-1]
+                source_spans[-1] = (source_start, source_index + 1)
+            continue
+        normalized.extend(stripped)
+        source_spans.extend((source_index, source_index + 1) for _ in stripped)
+    return "".join(normalized), tuple(source_spans)
