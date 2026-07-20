@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import wraps
@@ -18,7 +19,7 @@ from steam_catalog.db import Database
 from steam_catalog.exporters import export_csv, export_jsonl
 from steam_catalog.http import CachedHttpClient
 from steam_catalog.importers.library import import_library
-from steam_catalog.pipeline import CatalogPipeline
+from steam_catalog.pipeline import CatalogPipeline, RunStats
 from steam_catalog.sources.steam import SteamClient
 from steam_catalog.sources.steamspy import SteamSpyClient
 
@@ -31,6 +32,28 @@ class DiscoverySource(str, Enum):
 class ExportFormat(str, Enum):
     JSONL = "jsonl"
     CSV = "csv"
+
+
+@dataclass
+class _CollectionProgress:
+    outcomes: dict[str, str] = field(default_factory=dict)
+
+    def record(self, item_key: str, outcome: str) -> None:
+        if outcome not in {"complete", "failed"}:
+            raise ValueError(f"Unsupported collection outcome: {outcome}")
+        self.outcomes[item_key] = outcome
+
+    @property
+    def completed(self) -> int:
+        return sum(outcome == "complete" for outcome in self.outcomes.values())
+
+    @property
+    def failed(self) -> int:
+        return sum(outcome == "failed" for outcome in self.outcomes.values())
+
+    @property
+    def total(self) -> int:
+        return len(self.outcomes)
 
 
 _P = ParamSpec("_P")
@@ -113,20 +136,20 @@ def bootstrap_command(
 ) -> None:
     """Discover catalog candidates and queue eligible collection work."""
     settings: Settings = context.obj
-    starting_progress = (0, 0)
+    pipeline: CatalogPipeline | None = None
+    stats = RunStats()
     try:
         with _database(settings) as database:
-            starting_progress = _bootstrap_progress_totals(database, source.value)
-            with _pipeline(database, settings) as pipeline:
-                stats = pipeline.bootstrap(source.value, resume=resume, page_limit=page_limit)
+            with _pipeline(database, settings) as active_pipeline:
+                pipeline = active_pipeline
+                stats = active_pipeline.bootstrap(
+                    source.value, resume=resume, page_limit=page_limit
+                )
     except KeyboardInterrupt as error:
-        with _database(settings) as database:
-            current_progress = _bootstrap_progress_totals(database, source.value)
-        discovered = max(0, current_progress[0] - starting_progress[0])
-        queued = max(0, current_progress[1] - starting_progress[1])
+        progress = getattr(pipeline, "bootstrap_progress", stats)
         typer.echo("Interrupted; completed discovery pages remain resumable.")
-        typer.echo(f"Discovered: {discovered}")
-        typer.echo(f"Queued: {queued}")
+        typer.echo(f"Discovered: {progress.discovered}")
+        typer.echo(f"Queued: {progress.queued}")
         raise typer.Exit(130) from error
     typer.echo(f"Discovered: {stats.discovered}")
     typer.echo(f"Queued: {stats.queued}")
@@ -141,19 +164,13 @@ def collect_command(
 ) -> None:
     """Collect one app or consume resumable queued work."""
     settings: Settings = context.obj
-    completed = 0
-    failed = 0
+    progress = _CollectionProgress()
     active_lease_token: str | None = None
     active_item_key: str | None = None
-    direct_claimed = False
-    direct_status_before: str | None = None
-    starting_job_totals = (0, 0)
     try:
         with _database(settings) as database:
-            starting_job_totals = _collection_job_totals(database)
             if appid is not None:
                 item_key = str(appid)
-                direct_status_before = database.job_status("collect", item_key)
                 active_lease_token = secrets.token_urlsafe(32)
                 active_item_key = item_key
                 lease = database.requeue_and_claim_specific_job(
@@ -163,7 +180,6 @@ def collect_command(
                     active_lease_token = None
                     active_item_key = None
                     raise ValueError(f"Collect job for appid {appid} is already running")
-                direct_claimed = True
                 with _pipeline(database, settings) as pipeline:
                     try:
                         result = pipeline.collect_one(appid, lease_token=active_lease_token)
@@ -176,16 +192,18 @@ def collect_command(
                             next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                             max_attempts=settings.max_attempts,
                         )
+                        progress.record(item_key, "failed")
                         active_lease_token = None
                         active_item_key = None
                         raise
+                    progress.record(item_key, "complete")
                 active_lease_token = None
                 active_item_key = None
                 typer.echo(f"{result.status.replace('_', '-')}: 1")
                 return
 
             with _pipeline(database, settings) as pipeline:
-                while limit is None or completed + failed < limit:
+                while limit is None or progress.total < limit:
                     active_lease_token = secrets.token_urlsafe(32)
                     lease = database.claim_job("collect", lease_token=active_lease_token)
                     if lease is None:
@@ -204,82 +222,35 @@ def collect_command(
                             next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                             max_attempts=settings.max_attempts,
                         )
-                        failed += 1
+                        progress.record(item_key, "failed")
                         active_lease_token = None
                         active_item_key = None
                         typer.echo(f"Failed appid {item_key}: {error}")
                     else:
-                        completed += 1
+                        progress.record(item_key, "complete")
                         active_lease_token = None
                         active_item_key = None
     except KeyboardInterrupt as error:
-        active_completed = 0
-        active_failed = 0
         with _database(settings) as database:
             if active_lease_token is not None:
                 released = database.release_job_by_lease("collect", active_lease_token)
-                if not released and active_item_key is not None:
+                if (
+                    not released
+                    and active_item_key is not None
+                    and active_item_key not in progress.outcomes
+                ):
                     active_status = database.job_status("collect", active_item_key)
-                    active_completed = int(active_status == "complete")
-                    active_failed = int(active_status in {"failed", "permanent_failure"})
-            durable_completed, durable_failed = _durable_collection_deltas(
-                database,
-                starting_job_totals,
-                direct_status_before=direct_status_before,
-                direct_claimed=direct_claimed,
-            )
-        completed = max(completed + active_completed, durable_completed)
-        failed = max(failed + active_failed, durable_failed)
-        typer.echo(f"Interrupted. Completed: {completed}; Failed: {failed}")
+                    if active_status == "complete":
+                        progress.record(active_item_key, "complete")
+                    elif active_status in {"failed", "permanent_failure"}:
+                        progress.record(active_item_key, "failed")
+        typer.echo(f"Interrupted. Completed: {progress.completed}; Failed: {progress.failed}")
         raise typer.Exit(130) from error
 
-    typer.echo(f"Completed: {completed}")
-    typer.echo(f"Failed: {failed}")
-    if failed:
+    typer.echo(f"Completed: {progress.completed}")
+    typer.echo(f"Failed: {progress.failed}")
+    if progress.failed:
         raise typer.Exit(1)
-
-
-def _bootstrap_progress_totals(database: Database, source: str) -> tuple[int, int]:
-    discovered = database.connection.execute(
-        "SELECT COUNT(*) FROM source_items WHERE source = ?", (source,)
-    ).fetchone()[0]
-    queued = database.connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM sync_jobs
-        WHERE job_kind = 'collect' AND status IN ('pending', 'failed')
-        """
-    ).fetchone()[0]
-    return discovered, queued
-
-
-def _collection_job_totals(database: Database) -> tuple[int, int]:
-    row = database.connection.execute(
-        """
-        SELECT
-            COALESCE(SUM(status = 'complete'), 0) AS completed,
-            COALESCE(SUM(status IN ('failed', 'permanent_failure')), 0) AS failed
-        FROM sync_jobs
-        WHERE job_kind = 'collect'
-        """
-    ).fetchone()
-    return row["completed"], row["failed"]
-
-
-def _durable_collection_deltas(
-    database: Database,
-    starting_totals: tuple[int, int],
-    *,
-    direct_status_before: str | None = None,
-    direct_claimed: bool = False,
-) -> tuple[int, int]:
-    ending_totals = _collection_job_totals(database)
-    completed = ending_totals[0] - starting_totals[0]
-    failed = ending_totals[1] - starting_totals[1]
-    if direct_claimed:
-        completed += int(direct_status_before == "complete")
-        failed += int(direct_status_before in {"failed", "permanent_failure"})
-    return max(0, completed), max(0, failed)
 
 
 @app.command("refresh")

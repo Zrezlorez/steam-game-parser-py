@@ -80,6 +80,16 @@ class CatalogPipeline:
         self.database = database
         self.steam = steam
         self.steamspy = steamspy
+        self._bootstrap_discovered_appids: set[int] = set()
+        self._bootstrap_queued_appids: set[int] = set()
+
+    @property
+    def bootstrap_progress(self) -> RunStats:
+        """Return committed work owned by the current bootstrap invocation."""
+        return RunStats(
+            discovered=len(self._bootstrap_discovered_appids),
+            queued=len(self._bootstrap_queued_appids),
+        )
 
     def bootstrap(
         self,
@@ -92,25 +102,34 @@ class CatalogPipeline:
         if page_limit is not None and page_limit < 0:
             raise ValueError("page_limit must not be negative")
 
-        discovered = 0
-        queued = 0
+        self._bootstrap_discovered_appids.clear()
+        self._bootstrap_queued_appids.clear()
         for source_page, items in self._discovery_pages(source, resume, page_limit):
             timestamp = _utc_now()
+            page_discovered_appids: set[int] = set()
+            page_queued_appids: set[int] = set()
             with self.database.transaction():
                 for candidate in items:
-                    discovered += 1
+                    page_discovered_appids.add(candidate.appid)
+                    is_verified = self.database.has_authoritative_verification(candidate.appid)
+                    provisional_rejection = (
+                        candidate.provisional_reviews is not None
+                        and candidate.provisional_reviews < MIN_REVIEWS
+                        and not is_verified
+                    )
+                    if (
+                        provisional_rejection
+                        and self.database.job_status("collect", str(candidate.appid)) == "running"
+                    ):
+                        continue
+
                     self.database.upsert_source_item(
                         source,
                         candidate,
                         source_page=source_page,
                         fetched_at=timestamp,
                     )
-                    is_verified = self.database.has_authoritative_verification(candidate.appid)
-                    if (
-                        candidate.provisional_reviews is not None
-                        and candidate.provisional_reviews < MIN_REVIEWS
-                        and not is_verified
-                    ):
+                    if provisional_rejection:
                         self.database.record_game_status(
                             candidate.appid,
                             "below_provisional_threshold",
@@ -133,9 +152,12 @@ class CatalogPipeline:
                                 "pending",
                                 updated_at=timestamp,
                             )
-                        queued += 1
+                        page_queued_appids.add(candidate.appid)
 
-        return RunStats(discovered=discovered, queued=queued)
+            self._bootstrap_discovered_appids.update(page_discovered_appids)
+            self._bootstrap_queued_appids.update(page_queued_appids)
+
+        return self.bootstrap_progress
 
     def collect_one(self, appid: int, *, lease_token: str | None = None) -> CollectionResult:
         """Verify eligibility first, then persist one app's store metadata."""

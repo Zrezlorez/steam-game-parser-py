@@ -4,7 +4,7 @@ import pytest
 
 from steam_catalog.db import Database
 from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
-from steam_catalog.pipeline import CatalogPipeline
+from steam_catalog.pipeline import CatalogPipeline, RunStats
 
 
 def item(appid: int, reviews: int) -> DiscoveryItem:
@@ -502,6 +502,88 @@ def test_provisional_refresh_removes_stale_collect_job(pipeline_factory):
 
     assert db.game_status(10) == "below_provisional_threshold"
     assert db.job_status("collect", "10") is None
+
+
+def test_provisional_undercount_preserves_running_unverified_collection(tmp_path):
+    path = tmp_path / "running-undercount.sqlite3"
+    owner = Database(path)
+    bootstrap_database = Database(path)
+    owner.initialize()
+    bootstrap_database.initialize()
+    try:
+        owner.upsert_game(
+            appid=10,
+            name="Collection in progress",
+            eligibility_status="pending",
+            detailed_description_text="Keep this searchable state.",
+            updated_at="2026-07-20T00:00:00Z",
+        )
+        _store_sample(owner)
+        owner.enqueue_job("collect", "10")
+        lease = owner.claim_job("collect", lease_token="original-opaque-lease")
+        assert lease is not None
+
+        bootstrap_pipeline = CatalogPipeline(
+            bootstrap_database,
+            steam=FakeSteamClient(
+                review_total=20,
+                app_type="game",
+                coming_soon=False,
+                app_available=True,
+            ),
+            steamspy=FakeSteamSpyClient([[item(10, 19)]]),
+        )
+        stats = bootstrap_pipeline.bootstrap("steamspy", page_limit=1)
+
+        game = owner.connection.execute(
+            """
+            SELECT name, eligibility_status, detailed_description_text,
+                   steamspy_positive, steamspy_negative
+            FROM games WHERE appid = 10
+            """
+        ).fetchone()
+        job = owner.connection.execute(
+            """
+            SELECT status, attempt_count, lease_token
+            FROM sync_jobs WHERE job_kind = 'collect' AND item_key = '10'
+            """
+        ).fetchone()
+        assert stats == RunStats(discovered=1, queued=0)
+        assert tuple(game) == (
+            "Collection in progress",
+            "pending",
+            "Keep this searchable state.",
+            None,
+            None,
+        )
+        assert owner.connection.execute("SELECT COUNT(*) FROM source_items").fetchone()[0] == 0
+        assert owner.review_count(10) == 1
+        assert [row["recommendation_id"] for row in owner.search_reviews("retained", 10)] == ["old"]
+        assert (
+            owner.connection.execute(
+                "SELECT COUNT(*) FROM game_search WHERE game_search MATCH 'searchable'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert tuple(job) == ("running", lease["attempt_count"], "original-opaque-lease")
+
+        owner_pipeline = CatalogPipeline(
+            owner,
+            steam=FakeSteamClient(
+                review_total=20,
+                app_type="game",
+                coming_soon=False,
+                app_available=True,
+            ),
+            steamspy=FakeSteamSpyClient([]),
+        )
+        result = owner_pipeline.collect_one(10, lease_token="original-opaque-lease")
+
+        assert result.status == "eligible"
+        assert owner.job_status("collect", "10") == "complete"
+    finally:
+        bootstrap_database.close()
+        owner.close()
 
 
 def _store_old_sample(db: Database) -> None:

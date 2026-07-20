@@ -4,10 +4,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import steam_catalog.cli as cli_module
 from steam_catalog.cli import app
 from steam_catalog.db import Database
 from steam_catalog.models import DiscoveryItem
-from steam_catalog.pipeline import CollectionResult, RunStats
+from steam_catalog.pipeline import CatalogPipeline, CollectionResult, RunStats
 
 
 runner = CliRunner()
@@ -316,12 +317,15 @@ def test_bootstrap_interrupt_reports_current_run_deltas_not_historical_totals(
     @contextmanager
     def fake_pipeline(database, settings):
         class InterruptingPipeline:
+            bootstrap_progress = RunStats()
+
             def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
                 database.upsert_source_item(
                     source,
                     DiscoveryItem(appid=4, name="Current", payload_json='{"appid":4}'),
                 )
                 database.enqueue_job("collect", "4")
+                self.bootstrap_progress = RunStats(discovered=1, queued=1)
                 raise KeyboardInterrupt
 
         yield InterruptingPipeline()
@@ -333,6 +337,101 @@ def test_bootstrap_interrupt_reports_current_run_deltas_not_historical_totals(
     assert result.exit_code == 130
     assert "discovered: 1" in result.stdout.lower()
     assert "queued: 1" in result.stdout.lower()
+
+
+def test_bootstrap_interrupt_counts_forced_rediscovery_of_existing_item(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "bootstrap-rediscovery.sqlite3"
+    candidate = DiscoveryItem(
+        appid=10,
+        name="Rediscovered",
+        steamspy_positive=20,
+        steamspy_negative=0,
+        provisional_reviews=20,
+        payload_json='{"appid":10}',
+    )
+    database = _open_database(path)
+    database.upsert_source_item("steamspy", candidate, source_page=0)
+    database.close()
+
+    class StaticSteamSpy:
+        def fetch_page(self, page: int):
+            assert page == 0
+            return [candidate]
+
+    @contextmanager
+    def interrupting_pipeline(database, settings):
+        pipeline = CatalogPipeline(database, steam=object(), steamspy=StaticSteamSpy())
+        yield pipeline
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", interrupting_pipeline)
+
+    result = runner.invoke(
+        app,
+        [
+            "--database",
+            str(path),
+            "bootstrap",
+            "--no-resume",
+            "--page-limit",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 130
+    assert "discovered: 1" in result.stdout.lower()
+    assert "queued: 1" in result.stdout.lower()
+
+
+def test_bootstrap_interrupt_does_not_net_cancel_discarded_and_queued_jobs(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "bootstrap-discard-and-queue.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+    candidates = [
+        DiscoveryItem(
+            appid=10,
+            name="Rejected",
+            provisional_reviews=19,
+            payload_json='{"appid":10}',
+        ),
+        DiscoveryItem(
+            appid=11,
+            name="Queued",
+            provisional_reviews=20,
+            payload_json='{"appid":11}',
+        ),
+    ]
+
+    class StaticSteamSpy:
+        def fetch_page(self, page: int):
+            assert page == 0
+            return candidates
+
+    @contextmanager
+    def interrupting_pipeline(database, settings):
+        pipeline = CatalogPipeline(database, steam=object(), steamspy=StaticSteamSpy())
+        yield pipeline
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", interrupting_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "bootstrap", "--page-limit", "1"],
+    )
+
+    assert result.exit_code == 130
+    assert "discovered: 2" in result.stdout.lower()
+    assert "queued: 1" in result.stdout.lower()
+    database = _open_database(path)
+    assert database.job_status("collect", "10") is None
+    assert database.job_status("collect", "11") == "pending"
+    database.close()
 
 
 def test_collect_keyboard_interrupt_releases_job_and_exits_130(tmp_path: Path, monkeypatch):
@@ -478,6 +577,120 @@ def test_collect_interrupt_during_pipeline_cleanup_reports_durable_completion(
     assert "completed: 1" in result.stdout.lower()
     database = _open_database(path)
     assert database.job_status("collect", "10") == "complete"
+    database.close()
+
+
+def test_collect_interrupt_after_recorded_completion_counts_appid_once(tmp_path: Path, monkeypatch):
+    progress_type = getattr(cli_module, "_CollectionProgress", None)
+    assert progress_type is not None
+    original_record = progress_type.record
+    path = tmp_path / "recorded-completion.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+
+    @contextmanager
+    def completing_pipeline(database, settings):
+        class CompletingPipeline:
+            def collect_one(self, appid: int, *, lease_token: str | None = None):
+                database.complete_job("collect", str(appid), expected_lease_token=lease_token)
+                return CollectionResult(appid=appid, status="eligible")
+
+        yield CompletingPipeline()
+
+    def interrupt_after_record(self, item_key: str, outcome: str):
+        original_record(self, item_key, outcome)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", completing_pipeline)
+    monkeypatch.setattr(progress_type, "record", interrupt_after_record)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "collect", "--limit", "1"],
+    )
+
+    assert result.exit_code == 130
+    assert "completed: 1" in result.stdout.lower()
+    assert "failed: 0" in result.stdout.lower()
+
+
+def test_collect_interrupt_after_recorded_failure_counts_appid_once(tmp_path: Path, monkeypatch):
+    progress_type = getattr(cli_module, "_CollectionProgress", None)
+    assert progress_type is not None
+    original_record = progress_type.record
+    path = tmp_path / "recorded-failure.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    database.close()
+
+    class FailingPipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            raise ValueError("source failed")
+
+    @contextmanager
+    def failing_pipeline(*args, **kwargs):
+        yield FailingPipeline()
+
+    def interrupt_after_record(self, item_key: str, outcome: str):
+        original_record(self, item_key, outcome)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", failing_pipeline)
+    monkeypatch.setattr(progress_type, "record", interrupt_after_record)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "collect", "--limit", "1"],
+    )
+
+    assert result.exit_code == 130
+    assert "completed: 0" in result.stdout.lower()
+    assert "failed: 1" in result.stdout.lower()
+
+
+def test_collect_interrupt_ignores_unrelated_collector_terminal_change(tmp_path: Path, monkeypatch):
+    path = tmp_path / "unrelated-collector.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10", updated_at="2026-07-20T00:00:00Z")
+    database.enqueue_job("collect", "20", updated_at="2026-07-20T00:00:01Z")
+    database.close()
+
+    class InterruptingPipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            assert appid == 10
+            other = _open_database(path)
+            try:
+                unrelated = other.claim_specific_job(
+                    "collect", "20", lease_token="unrelated-opaque-lease"
+                )
+                assert unrelated is not None
+                other.complete_job(
+                    "collect",
+                    "20",
+                    expected_lease_token="unrelated-opaque-lease",
+                )
+            finally:
+                other.close()
+            raise KeyboardInterrupt
+
+    @contextmanager
+    def interrupting_pipeline(*args, **kwargs):
+        yield InterruptingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", interrupting_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "collect", "--limit", "1"],
+    )
+
+    assert result.exit_code == 130
+    assert "completed: 0" in result.stdout.lower()
+    assert "failed: 0" in result.stdout.lower()
+    database = _open_database(path)
+    assert database.job_status("collect", "10") == "pending"
+    assert database.job_status("collect", "20") == "complete"
     database.close()
 
 
