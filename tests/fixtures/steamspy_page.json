@@ -1,0 +1,14 @@
+{
+  "10": {
+    "appid": 10,
+    "name": "Drill Builder",
+    "positive": 12,
+    "negative": 8
+  },
+  "11": {
+    "appid": "11",
+    "name": "Small Builder",
+    "positive": 10,
+    "negative": 9
+  }
+}

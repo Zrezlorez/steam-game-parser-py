@@ -1,0 +1,33 @@
+{
+  "success": 1,
+  "query_summary": {
+    "num_reviews": 20,
+    "total_positive": 12,
+    "total_negative": 8,
+    "review_score": 8,
+    "review_score_desc": "Very Positive"
+  },
+  "cursor": "next-page",
+  "reviews": [
+    {
+      "recommendationid": "review-1",
+      "language": "english",
+      "review": "Excellent drills.",
+      "timestamp_created": 1784505600,
+      "timestamp_updated": 1784592000,
+      "voted_up": true,
+      "votes_up": 4,
+      "votes_funny": 1,
+      "weighted_vote_score": "0.9",
+      "comment_count": 2,
+      "steam_purchase": true,
+      "received_for_free": false,
+      "written_during_early_access": false,
+      "author": {
+        "steamid": "76561198000000000",
+        "playtime_forever": 360,
+        "playtime_at_review": 120
+      }
+    }
+  ]
+}

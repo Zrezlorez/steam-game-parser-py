@@ -1,0 +1,22 @@
+{
+  "10": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "name": "Drill Builder",
+      "release_date": {"coming_soon": false, "date": "20 Jul, 2026"},
+      "short_description": "<b>Dig</b> faster",
+      "detailed_description": "<p>Build drills.</p><ul><li>Improve belts</li></ul>",
+      "about_the_game": "<div>Mine &amp; automate</div>",
+      "developers": ["Example Studio"],
+      "publishers": ["Example Publisher"],
+      "supported_languages": "English, Russian",
+      "platforms": {"windows": true, "mac": false, "linux": true},
+      "categories": [{"id": 2, "description": "Single-player"}],
+      "genres": [{"id": "23", "description": "Indie"}],
+      "header_image": "https://cdn.example.test/header.jpg",
+      "screenshots": [{"id": 1, "path_full": "https://cdn.example.test/one.jpg"}],
+      "price_overview": {"currency": "USD", "initial": 999, "final": 499}
+    }
+  }
+}
