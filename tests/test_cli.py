@@ -459,6 +459,42 @@ def test_collect_direct_appid_interrupt_reports_zero_durable_counts(tmp_path: Pa
     assert "failed: 0" in result.stdout.lower()
 
 
+def test_collect_direct_appid_commit_then_cleanup_interrupt_reports_completion(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "direct-complete.sqlite3"
+
+    @contextmanager
+    def interrupting_pipeline(database, settings):
+        class CompletingPipeline:
+            def collect_one(self, appid: int, *, lease_token: str | None = None):
+                assert lease_token is None
+                database.record_game_status(
+                    appid,
+                    "eligible",
+                    updated_at="2026-07-20T00:00:00+00:00",
+                )
+                return CollectionResult(appid=appid, status="eligible")
+
+        yield CompletingPipeline()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", interrupting_pipeline)
+
+    result = runner.invoke(
+        app,
+        ["--database", str(path), "collect", "--appid", "4000"],
+    )
+
+    assert result.exit_code == 130
+    assert "completed: 1" in result.stdout.lower()
+    assert "failed: 0" in result.stdout.lower()
+    database = _open_database(path)
+    assert database.game_status(4000) == "eligible"
+    assert database.job_status("collect", "4000") is None
+    database.close()
+
+
 def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch):
     class FakePipeline:
         def collect_one(self, appid: int, *, lease_token: str | None = None):

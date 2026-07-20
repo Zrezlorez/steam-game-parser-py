@@ -146,6 +146,8 @@ def collect_command(
     completed = 0
     failed = 0
     active_lease_token: str | None = None
+    direct_appid_for_progress: int | None = None
+    direct_game_before: tuple[object, ...] | None = None
     del resume
     try:
         with _database(settings) as database, _pipeline(database, settings) as pipeline:
@@ -155,6 +157,9 @@ def collect_command(
                     "collect", str(appid), lease_token=active_lease_token
                 )
                 if lease is None:
+                    if database.job_status("collect", str(appid)) is None:
+                        direct_appid_for_progress = appid
+                        direct_game_before = _game_collection_fingerprint(database, appid)
                     active_lease_token = None
                     result = pipeline.collect_one(appid)
                 else:
@@ -203,7 +208,11 @@ def collect_command(
         with _database(settings) as database:
             if active_lease_token is not None:
                 database.release_job_by_lease("collect", active_lease_token)
-            completed, failed = _durable_collection_counts(database)
+            completed, failed = _durable_collection_counts(
+                database,
+                direct_appid=direct_appid_for_progress,
+                direct_game_before=direct_game_before,
+            )
         typer.echo(f"Interrupted. Completed: {completed}; Failed: {failed}")
         raise typer.Exit(130) from error
 
@@ -213,7 +222,12 @@ def collect_command(
         raise typer.Exit(1)
 
 
-def _durable_collection_counts(database: Database) -> tuple[int, int]:
+def _durable_collection_counts(
+    database: Database,
+    *,
+    direct_appid: int | None = None,
+    direct_game_before: tuple[object, ...] | None = None,
+) -> tuple[int, int]:
     row = database.connection.execute(
         """
         SELECT
@@ -226,7 +240,30 @@ def _durable_collection_counts(database: Database) -> tuple[int, int]:
         WHERE job_kind = 'collect'
         """
     ).fetchone()
-    return row["completed"], row["failed"]
+    completed = row["completed"]
+    if direct_appid is not None:
+        direct_game_after = _game_collection_fingerprint(database, direct_appid)
+        direct_job_status = database.job_status("collect", str(direct_appid))
+        if (
+            direct_game_after is not None
+            and direct_game_after != direct_game_before
+            and direct_game_after[0] in {"eligible", "below_verified_threshold", "ineligible"}
+            and direct_job_status != "complete"
+        ):
+            completed += 1
+    return completed, row["failed"]
+
+
+def _game_collection_fingerprint(database: Database, appid: int) -> tuple[object, ...] | None:
+    row = database.connection.execute(
+        """
+        SELECT eligibility_status, updated_at, metadata_fetched_at, reviews_fetched_at
+        FROM games
+        WHERE appid = ?
+        """,
+        (appid,),
+    ).fetchone()
+    return None if row is None else tuple(row)
 
 
 @app.command("refresh")
