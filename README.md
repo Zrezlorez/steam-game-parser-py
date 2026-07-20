@@ -1,91 +1,351 @@
 # Steam Catalog
 
-Steam Catalog builds a local SQLite catalog of released Steam games with verified review totals,
-store metadata, small categorized review samples, optional personal-library data, full-text search,
-and streaming JSONL or CSV exports. It requires Python 3.11 or newer.
+Steam Catalog собирает локальный каталог выпущенных игр Steam в SQLite. Каталог содержит
+проверенное количество отзывов, метаданные и описания из Steam Store, небольшие выборки полезных
+и свежих отзывов, а также необязательные сведения из личной библиотеки. Получившуюся базу можно
+искать через SQLite FTS5, экспортировать в JSONL/CSV или анализировать локальными инструментами.
 
-## Quick Start
+Проект рассчитан на длительный сбор большого каталога. Все важные результаты сохраняются
+транзакционно: работу можно остановить через `Ctrl+C` и продолжить той же командой.
 
-Run this exact PowerShell sequence from the directory that contains `steam_catalog` and `data`:
+## Возможности
+
+- поиск кандидатов через бесплатный API SteamSpy или список приложений Steam;
+- раннее исключение игр, у которых по SteamSpy меньше 20 отзывов;
+- повторная проверка количества отзывов по данным Steam перед загрузкой метаданных;
+- исключение недоступных, невыпущенных приложений и приложений не типа `game`;
+- сохранение описаний, разработчиков, издателей, языков, платформ, жанров, категорий, цены,
+  изображений и других данных Steam Store;
+- до 5 полезных и 5 свежих отзывов каждой полярности;
+- импорт владения, игрового времени и даты последнего запуска из личной библиотеки;
+- полнотекстовый поиск FTS5 по играм и сохранённым отзывам;
+- возобновляемые очереди, ограниченные повторы запросов и HTTP-кэш;
+- потоковый экспорт подходящих игр в JSONL или CSV.
+
+Все данные остаются на компьютере пользователя. SteamDB проект не запрашивает.
+
+## Требования
+
+- Windows 10/11;
+- PowerShell;
+- 64-битный Python 3.11 или новее;
+- доступ в интернет;
+- свободное место для SQLite-каталога и HTTP-кэша.
+
+Проверить установленную версию Python:
 
 ```powershell
-cd steam_catalog
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
-steam-catalog run --library ..\data\steam_info.json
+python --version
 ```
 
-The first `run` initializes SQLite, imports the library, discovers games through SteamSpy, and
-consumes all collection jobs available now. Later incremental updates need only:
+Если команда отсутствует, установите актуальный Python с
+[python.org](https://www.python.org/downloads/windows/) и включите добавление Python в `PATH` в
+установщике.
+
+Полный сбор может занимать много часов. SteamSpy ограничивает частоту запросов, а обработка одной
+подходящей игры требует нескольких запросов к Steam Store. Это нормальная часть работы, а не
+зависание программы.
+
+## Установка
+
+Получите исходники через GitHub и откройте PowerShell **в корне проекта**. В этой папке должны
+находиться `pyproject.toml`, `README.md`, каталоги `src` и `tests`.
+
+Создайте отдельное виртуальное окружение:
+
+```powershell
+python -m venv .venv
+```
+
+Активируйте его:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+`Activate.ps1` не устанавливает и не изменяет системный Python. Скрипт только добавляет
+`.venv\Scripts` в начало `PATH` текущего окна PowerShell, поэтому команды `python`, `pip` и
+`steam-catalog` начинают использовать окружение проекта.
+
+Обновите `pip` и установите Steam Catalog:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Флаг `-e` создаёт редактируемую установку: после обновления исходников переустанавливать пакет
+обычно не нужно. Проверьте CLI:
+
+```powershell
+steam-catalog --help
+```
+
+### Если PowerShell блокирует Activate.ps1
+
+Разрешите запуск скриптов только в текущем процессе PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Настройки системы и других окон PowerShell эта команда не меняет.
+
+### Запуск без активации
+
+Активация не обязательна. Можно всегда обращаться к исполняемым файлам окружения напрямую:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\steam-catalog.exe --help
+```
+
+В остальных примерах используется активированная `.venv` для краткости.
+
+## Первый запуск
+
+Самый простой вариант без личной библиотеки:
 
 ```powershell
 steam-catalog run
 ```
 
-Each game is printed after its result is committed to SQLite. Pressing Ctrl+C exits with status
-130 and leaves the catalog resumable with the same command. Network failures are scheduled for a
-later retry; `run` stops when no job is claimable now instead of waiting for retry delays.
-
-The global `--database` option selects another SQLite file. It must appear before the command:
+Если файл личной библиотеки уже подготовлен в `data\steam_info.json`:
 
 ```powershell
-steam-catalog --database .\data\alternate.sqlite3 run
-python -m steam_catalog --database .\data\alternate.sqlite3 status
+steam-catalog run --library .\data\steam_info.json
 ```
 
-Every data command initializes the schema when needed. The individual commands below remain
-available when bounded runs or manual control are useful.
+Параметр `--library` необязателен. При первом запуске `run`:
 
-## Collection Workflow
+1. создаёт или обновляет схему `data\steam_catalog.sqlite3`;
+2. импортирует библиотеку, если указан `--library`;
+3. обнаруживает кандидатов через SteamSpy;
+4. обрабатывает всю очередь заданий, доступных в данный момент;
+5. выводит итог текущего запуска.
 
-SteamSpy is the recommended discovery source because its provisional counts avoid unnecessary
-Steam Store requests. Steam's application list is available as a fallback.
+Для последующих обновлений достаточно:
 
 ```powershell
-# Discover all SteamSpy pages and preserve completed pages on restart.
-steam-catalog bootstrap --source steamspy --resume
+steam-catalog run
+```
 
-# Or discover from Steam's app list.
-steam-catalog bootstrap --source steam --resume
+## Как устроен сбор данных
 
-# Try a bounded collection run, then consume the complete durable queue.
-steam-catalog collect --limit 10
+Сбор разделён на два этапа.
+
+### Discover
+
+`Discover` получает страницы SteamSpy и быстро создаёт кандидатов. На этом этапе в `games` обычно
+есть только `appid`, название, предварительные оценки и служебный статус. Поля описания, жанров,
+изображений и сохранённых отзывов ещё пусты — это ожидаемые placeholder-строки, а не ошибка БД.
+
+Кандидаты с предварительным количеством отзывов меньше 20 получают статус
+`below_provisional_threshold` и не попадают в очередь, если ранее не были проверены по Steam.
+
+Прогресс выводится до запроса и после надёжной записи страницы:
+
+```text
+Discovery page 4: fetching...
+Discovery page 4: saved, discovered=1000, queued=734, total_discovered=5000, total_queued=4465, 1.2s
+```
+
+Строка `saved` появляется после commit страницы в SQLite. Счётчики `total_*` относятся к текущему
+запуску, а не ко всей истории БД.
+
+### Collect
+
+`Collect` берёт задания из SQLite по одному и:
+
+1. проверяет актуальное количество отзывов через Steam;
+2. требует не менее 20 отзывов;
+3. проверяет доступность, тип приложения и факт выпуска;
+4. загружает метаданные Steam Store;
+5. сохраняет выборки полезных и свежих положительных/отрицательных отзывов;
+6. завершает задание в той же транзакционной модели.
+
+Пример строки прогресса:
+
+```text
+[42/3731] Example Game (appid 123456) - saved, reviews=20, 1.7s
+```
+
+`reviews=20` означает число сохранённых образцов отзывов, а не общее число отзывов в Steam.
+
+Статусы обработки:
+
+| Статус | Значение |
+| --- | --- |
+| `saved` | Игра подходит, данные и отзывы записаны |
+| `skipped` | Игра не прошла проверку количества отзывов, типа, доступности или выпуска |
+| `retry` | Возникла ожидаемая ошибка; повтор назначен на более позднее время |
+| `failed` | Исчерпан лимит попыток, задание стало постоянной ошибкой |
+
+### Прерывание и продолжение
+
+Нажатие `Ctrl+C` завершает команду с кодом `130`. Уже сохранённые страницы и игры остаются в БД,
+а незавершённый lease возвращается в очередь без потери попытки. Повторите ту же команду, чтобы
+продолжить.
+
+Ошибки с будущим временем повтора не заставляют `run` ждать бесконечно. Команда заканчивает
+доступную сейчас работу; отложенные задания будут обработаны при следующем запуске.
+
+## Управление объёмом работы
+
+Полный последовательный цикл:
+
+```powershell
+steam-catalog run
+```
+
+Обнаружить только следующую страницу SteamSpy, затем обработать **всю уже доступную очередь**:
+
+```powershell
+steam-catalog run --page-limit 1
+```
+
+Обработать ранее найденную очередь, не продолжая discovery:
+
+```powershell
 steam-catalog collect
+```
 
-# Fetch exactly one app without changing unrelated queued work.
+Ограничить текущий запуск ста играми:
+
+```powershell
+steam-catalog collect --limit 100
+```
+
+Принудительно обновить одну конкретную игру:
+
+```powershell
 steam-catalog collect --appid 4000
+```
 
-# Inspect eligibility, completeness, queue, retry, and failure counts.
+Не запускайте `run`/`bootstrap` и `collect` одновременно для одной БД. Последовательные команды
+проще диагностировать и не создают лишнюю конкуренцию за SQLite и внешние лимиты.
+
+## Команды
+
+| Команда | Назначение |
+| --- | --- |
+| `run` | Полный цикл: схема, необязательный импорт, discovery и collection |
+| `init` | Создать или обновить схему SQLite |
+| `import-library` | Импортировать личную библиотеку из JSON |
+| `bootstrap` | Найти кандидатов и наполнить очередь |
+| `collect` | Обработать одну игру или очередь |
+| `refresh` | Повторно поставить устаревшие записи в очередь |
+| `status` | Показать состояния каталога и очереди |
+| `export` | Экспортировать подходящие игры в JSONL или CSV |
+
+Подробная справка доступна для каждой команды:
+
+```powershell
+steam-catalog run --help
+steam-catalog collect --help
+steam-catalog export --help
+```
+
+### Выбор источника discovery
+
+SteamSpy используется по умолчанию и позволяет заранее отсеять малозаметные приложения:
+
+```powershell
+steam-catalog bootstrap --source steamspy --resume
+```
+
+Список приложений Steam доступен как запасной источник, но не содержит предварительных счётчиков:
+
+```powershell
+steam-catalog bootstrap --source steam --resume
+```
+
+`--no-resume` принудительно начинает discovery источника с начала. Обычно нужен `--resume`.
+
+### Статус
+
+```powershell
 steam-catalog status
 ```
 
-The initial bootstrap and full collection can take many hours. Cached requests and durable jobs
-make later runs incremental. Pressing Ctrl+C leaves work resumable and exits with status 130.
+Команда показывает подходящие и исключённые игры, заполненность метаданных/отзывов, ожидающие,
+выполняющиеся, отложенные и окончательно провалившиеся задания.
 
-To schedule records whose authoritative Steam verification is older than a UTC cutoff, use
-`refresh`. Rows that have never been verified are conservatively stale. Permanent failures remain
-untouched unless `--failed` is explicit:
+### Обновление устаревших данных
+
+Поставить в очередь игры, проверенные более 30 дней назад:
 
 ```powershell
 steam-catalog refresh --older-than-days 30
+steam-catalog collect
+```
+
+Также вернуть задания из `permanent_failure`:
+
+```powershell
 steam-catalog refresh --older-than-days 30 --failed
 steam-catalog collect
 ```
 
-## Library Import
+### Другая база данных
 
-`import-library` accepts a top-level JSON array of Steam library entries keyed by `appid`. Repeated
-imports update library-owned fields without replacing collected catalog metadata.
+Глобальный `--database` указывается **до** команды:
 
 ```powershell
-steam-catalog import-library ..\data\steam_info.json
+steam-catalog --database .\data\alternate.sqlite3 status
+steam-catalog --database .\data\alternate.sqlite3 run
 ```
 
-## Search
+Также путь можно задать через переменную окружения, описанную ниже.
 
-The database maintains FTS5 indexes for normalized game metadata and stored review samples. Open
-the configured database in any SQLite client and use queries such as:
+## Импорт личной библиотеки
+
+`import-library` принимает JSON-массив. Каждая запись должна содержать положительный целочисленный
+`appid`. Остальные поддерживаемые поля необязательны.
+
+Минимальный практический пример:
+
+```json
+[
+  {
+    "appid": 4000,
+    "name": "Garry's Mod",
+    "playtime_forever": 1200,
+    "playtime_2weeks": 60,
+    "rtime_last_played": 1767225600
+  }
+]
+```
+
+Поддерживаются также поля игрового времени по платформам:
+`playtime_windows_forever`, `playtime_mac_forever`, `playtime_linux_forever` и
+`playtime_deck_forever`. Время указывается в минутах, `rtime_last_played` — Unix timestamp.
+
+Отдельный импорт:
+
+```powershell
+steam-catalog import-library .\data\steam_info.json
+```
+
+Повторный импорт обновляет только поля, принадлежащие библиотеке пользователя, и не заменяет
+собранные метаданные каталога.
+
+Файл содержит личные данные: список игр, игровое время и даты запусков. `data\steam_info.json`
+исключён через `.gitignore`; не публикуйте его и заполненную личную БД без проверки содержимого.
+
+## База данных и поиск
+
+По умолчанию база находится здесь:
+
+```text
+data\steam_catalog.sqlite3
+```
+
+SQLite можно открыть любым клиентом, поддерживающим FTS5. Во время работающей команды рядом могут
+появляться файлы `-wal` и `-shm` — это штатное состояние SQLite WAL, их не нужно коммитить.
+
+Поиск игр по метаданным и описаниям:
 
 ```sql
 SELECT games.appid, games.name
@@ -94,7 +354,11 @@ JOIN games ON games.appid = game_search.rowid
 WHERE game_search MATCH 'factory automation'
 ORDER BY bm25(game_search)
 LIMIT 20;
+```
 
+Поиск внутри сохранённых отзывов:
+
+```sql
 SELECT reviews.appid, games.name, reviews.recommendation_id
 FROM review_search
 JOIN reviews ON reviews.rowid = review_search.rowid
@@ -104,27 +368,175 @@ ORDER BY bm25(review_search)
 LIMIT 20;
 ```
 
-## Export
+Для рекомендаций имеет смысл анализировать только записи, которые прошли `Collect`: во время
+`Discover` большинство полей закономерно пусты.
 
-Exports include only verified eligible games and replace the destination atomically. JSONL can
-optionally include the stored review records; CSV deliberately stays game-oriented.
+## Экспорт
+
+Экспорт включает только проверенные подходящие игры. Файл назначения заменяется атомарно.
+
+JSON Lines без текстов отзывов:
 
 ```powershell
 steam-catalog export .\data\catalog.jsonl --format jsonl
+```
+
+JSON Lines с сохранёнными отзывами:
+
+```powershell
 steam-catalog export .\data\catalog-with-reviews.jsonl --format jsonl --include-reviews
+```
+
+CSV с данными игр:
+
+```powershell
 steam-catalog export .\data\catalog.csv --format csv
 ```
 
-Normal CLI output contains counts and statuses, not raw source payloads or review text.
+`--include-reviews` доступен только для JSONL.
 
-## Sources And Limits
+## Настройка через переменные окружения
 
-- Steam Web API supplies the application list; Steam Store endpoints supply app details and review
-  summaries/samples.
-- SteamSpy supplies discovery pages and provisional review counts. It has no paid requirement, but
-  its API has strict rate limits; the collector deliberately spaces full-catalog requests.
-- SteamDB is not used or accessed.
-- Source endpoints and response formats are third-party interfaces and may change. Parser errors
-  are reported concisely and leave durable work available for a later retry.
-- Runtime dependencies remain `httpx` and `typer`; development checks additionally use `pytest`,
-  `respx`, and `ruff`.
+Переменные читаются при каждом запуске процесса:
+
+| Переменная | Значение по умолчанию | Назначение |
+| --- | ---: | --- |
+| `STEAM_CATALOG_DATABASE` | `data\steam_catalog.sqlite3` | Путь к SQLite, если не указан `--database` |
+| `STEAM_CATALOG_REQUEST_TIMEOUT_SECONDS` | `30` | Таймаут HTTP-запроса |
+| `STEAM_CATALOG_STEAM_INTERVAL_SECONDS` | `1` | Минимальный интервал запросов Steam |
+| `STEAM_CATALOG_STEAMSPY_INTERVAL_SECONDS` | `1` | Интервал обычных запросов SteamSpy |
+| `STEAM_CATALOG_STEAMSPY_ALL_INTERVAL_SECONDS` | `60` | Интервал постраничного каталога SteamSpy |
+| `STEAM_CATALOG_MAX_ATTEMPTS` | `3` | Максимум попыток задания |
+| `STEAM_CATALOG_CACHE_TTL_HOURS` | `24` | Срок жизни HTTP-кэша |
+
+Пример настройки только для текущего окна PowerShell:
+
+```powershell
+$env:STEAM_CATALOG_MAX_ATTEMPTS = "5"
+steam-catalog run
+```
+
+Не уменьшайте интервалы без понимания лимитов источников: более агрессивные запросы могут привести
+к HTTP 429, временной блокировке или дополнительным повторам.
+
+## Решение проблем
+
+### `python` не найден или версия ниже 3.11
+
+Установите актуальный 64-битный Python с python.org, включите добавление в `PATH`, откройте новое
+окно PowerShell и снова выполните `python --version`.
+
+### PowerShell запрещает запуск Activate.ps1
+
+Используйте разрешение только для текущего процесса:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Либо запускайте `.\.venv\Scripts\python.exe` и `.\.venv\Scripts\steam-catalog.exe` напрямую.
+
+### `.venv` ссылается на удалённую версию Python
+
+Виртуальное окружение связано с интерпретатором, которым было создано. После удаления или
+перемещения Python окружение нужно пересоздать. Закройте процессы, использующие `.venv`, затем из
+корня проекта выполните:
+
+```powershell
+deactivate
+Remove-Item -LiteralPath .venv -Recurse -Force
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+```
+
+Если `deactivate` недоступна, просто откройте новое окно PowerShell. Удаляйте только `.venv` — не
+каталог `data`.
+
+### `No module named steam_catalog`
+
+Установка не выполнена в используемом интерпретаторе. Перейдите в папку с `pyproject.toml` и
+выполните:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\steam-catalog.exe --help
+```
+
+Запуск `python -m steam_catalog` тоже работает только после установки пакета в этот Python.
+
+### Команда `steam-catalog` не найдена
+
+Активируйте `.venv` или используйте полный путь:
+
+```powershell
+.\.venv\Scripts\steam-catalog.exe status
+```
+
+### В БД много строк с пустыми полями
+
+Проверьте статус:
+
+```powershell
+steam-catalog status
+```
+
+Если много `pending`, discovery уже создал placeholders, но collection ещё не закончился. Запустите:
+
+```powershell
+steam-catalog collect
+```
+
+### После `Discover: steamspy` работа кажется медленной
+
+Смотрите строки `Discovery page N: fetching...` и `saved`. Постраничный SteamSpy endpoint намеренно
+ограничен интервалом по умолчанию 60 секунд. `Ctrl+C` безопасен; завершённые страницы сохраняются.
+
+### Остались `retrying` или `permanent-failure`
+
+`retrying` имеет отложенное время следующей попытки. Подождите и снова выполните `run` или
+`collect`. Для окончательных ошибок после устранения причины используйте осознанный refresh:
+
+```powershell
+steam-catalog refresh --older-than-days 30 --failed
+steam-catalog collect
+```
+
+## Разработка
+
+Установите дополнительные зависимости:
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+Запустите тесты и линтер:
+
+```powershell
+python -m pytest
+python -m ruff check src tests
+```
+
+Runtime-зависимости проекта — `httpx` и `typer`. Тесты дополнительно используют `pytest`, `respx`
+и `ruff`.
+
+## Источники и ограничения
+
+- SteamSpy предоставляет страницы discovery и предварительные счётчики отзывов. Платная подписка
+  не требуется, но API строго ограничивает частоту запросов.
+- Steam предоставляет список приложений, данные Steam Store и отзывы. Реализованные endpoint'ы не
+  требуют Steam API key.
+- SteamDB не используется и не запрашивается.
+- Внешние endpoint'ы и форматы ответов могут измениться независимо от проекта.
+- HTML и доступность приложений зависят от ответа Steam для текущего региона/момента.
+- Каталог не гарантирует наличие всех когда-либо выпущенных игр: источники могут задерживать,
+  скрывать или удалять данные.
+- Обычный вывод CLI не содержит сырые payload'ы и тексты отзывов.
+
+## Лицензия
+
+В репозитории пока нет файла `LICENSE`. Публикация исходников на GitHub сама по себе не задаёт
+условия копирования и повторного использования. Перед тем как явно разрешать другим людям
+использование или распространение проекта, владельцу следует выбрать и добавить подходящую
+лицензию.

@@ -8,3 +8,9 @@ build/
 dist/
 data/*.sqlite3
 .superpowers/
+
+# Local IDE, personal library, and SQLite runtime state
+.idea/
+data/steam_info.json
+*.sqlite3-wal
+*.sqlite3-shm
