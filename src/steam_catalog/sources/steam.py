@@ -17,6 +17,7 @@ REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 METADATA_CACHE_TTL = timedelta(days=7)
 REVIEWS_CACHE_TTL = timedelta(days=1)
 _WHITESPACE = re.compile(r"\s+")
+_STRUCTURAL_BREAK = object()
 _BLOCK_TAGS = frozenset(
     {
         "address",
@@ -93,7 +94,7 @@ class _TextExtractor(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
+        self.parts: list[str | object] = []
         self.hidden_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -119,11 +120,11 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
     def _newline(self) -> None:
-        if self.parts and self.parts[-1] != "\n":
-            self.parts.append("\n")
+        if self.parts and self.parts[-1] is not _STRUCTURAL_BREAK:
+            self.parts.append(_STRUCTURAL_BREAK)
 
     def _space(self) -> None:
-        if self.parts and not self.parts[-1].isspace():
+        if self.parts and isinstance(self.parts[-1], str) and not self.parts[-1].isspace():
             self.parts.append(" ")
 
 
@@ -132,7 +133,10 @@ def normalize_html(value: str) -> str:
     parser = _TextExtractor()
     parser.feed(value)
     parser.close()
-    lines = [_WHITESPACE.sub(" ", line).strip() for line in "".join(parser.parts).splitlines()]
+    rendered = "".join(
+        "\n" if part is _STRUCTURAL_BREAK else _WHITESPACE.sub(" ", part) for part in parser.parts
+    )
+    lines = [line.strip() for line in rendered.split("\n")]
     return "\n".join(line for line in lines if line)
 
 
@@ -207,8 +211,10 @@ def parse_review_page(appid: int, payload: Mapping[str, Any]) -> ReviewPage:
     """Parse Steam aggregate review data and valid review records."""
     summary = payload.get("query_summary")
     source_reviews = payload.get("reviews")
+    success = payload.get("success")
     if (
-        payload.get("success") != 1
+        type(success) is not int
+        or success != 1
         or not isinstance(summary, Mapping)
         or not isinstance(source_reviews, list)
     ):

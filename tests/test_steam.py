@@ -24,6 +24,21 @@ def test_normalize_html_collapses_unicode_whitespace():
     assert normalize_html("<p>Build&nbsp;and\u2003improve</p>") == "Build and improve"
 
 
+@pytest.mark.parametrize("raw_whitespace", ["\n", "\r\n", "\f", "\v", "\u2028", "\u2029"])
+def test_normalize_html_collapses_raw_text_whitespace_to_spaces(raw_whitespace):
+    assert normalize_html(f"Build{raw_whitespace}and{raw_whitespace}improve") == "Build and improve"
+
+
+def test_normalize_html_retains_structural_boundaries_as_newlines():
+    assert (
+        normalize_html(
+            "<p>First</p><p>Second</p><ul><li>Third</li><li>Fourth</li></ul>"
+            "<table><tr><td>One</td><td>Two</td></tr></table><br>Last"
+        )
+        == "First\nSecond\nThird\nFourth\nOne\nTwo\nLast"
+    )
+
+
 def test_normalize_html_preserves_boundaries_around_suppressed_content_and_table_cells():
     assert (
         normalize_html(
@@ -113,6 +128,19 @@ def test_parse_review_page_rejects_unsuccessful_response():
                 "reviews": [],
             },
         )
+
+
+@pytest.mark.parametrize("success", [True, 1.0, "1", None, 0])
+def test_parse_review_page_rejects_non_exact_success_values(success):
+    payload = {
+        "query_summary": {"total_reviews": 0, "total_positive": 0, "total_negative": 0},
+        "reviews": [],
+    }
+    if success is not None:
+        payload["success"] = success
+
+    with pytest.raises(ValueError, match="Steam reviews"):
+        parse_review_page(10, payload)
 
 
 def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
