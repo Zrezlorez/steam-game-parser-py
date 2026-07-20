@@ -742,7 +742,13 @@ class Database:
                 self.enqueue_job("collect", row["item_key"], resume=False, updated_at=timestamp)
         return len(rows)
 
-    def claim_job(self, job_kind: str, *, now: str | None = None) -> sqlite3.Row | None:
+    def claim_job(
+        self,
+        job_kind: str,
+        *,
+        now: str | None = None,
+        lease_token: str | None = None,
+    ) -> sqlite3.Row | None:
         """Atomically claim the highest-priority due job within the attempt limit."""
         timestamp = now or _utc_now()
         with self.transaction():
@@ -785,7 +791,7 @@ class Database:
             ).fetchone()
             if candidate is None:
                 return None
-            lease_token = secrets.token_urlsafe(32)
+            selected_lease_token = lease_token or secrets.token_urlsafe(32)
             self.connection.execute(
                 """
                 UPDATE sync_jobs
@@ -793,11 +799,63 @@ class Database:
                     lease_token = ?, next_attempt_at = NULL, updated_at = ?
                 WHERE job_kind = ? AND item_key = ?
                 """,
-                (lease_token, timestamp, job_kind, candidate["item_key"]),
+                (selected_lease_token, timestamp, job_kind, candidate["item_key"]),
             )
             return self.connection.execute(
                 "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
                 (job_kind, candidate["item_key"]),
+            ).fetchone()
+
+    def claim_specific_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        *,
+        now: str | None = None,
+        lease_token: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Atomically claim one requested due job without changing other queued work."""
+        timestamp = now or _utc_now()
+        selected_lease_token = lease_token or secrets.token_urlsafe(32)
+        with self.transaction():
+            self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'permanent_failure', lease_token = NULL,
+                    next_attempt_at = NULL, updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                  AND status IN ('pending', 'failed')
+                  AND attempt_count >= ?
+                """,
+                (timestamp, job_kind, item_key, self.max_attempts),
+            )
+            cursor = self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'running', attempt_count = attempt_count + 1,
+                    lease_token = ?, next_attempt_at = NULL, updated_at = ?
+                WHERE job_kind = ? AND item_key = ?
+                  AND status IN ('pending', 'failed')
+                  AND attempt_count < ?
+                  AND (
+                      next_attempt_at IS NULL
+                      OR julianday(next_attempt_at) <= julianday(?)
+                  )
+                """,
+                (
+                    selected_lease_token,
+                    timestamp,
+                    job_kind,
+                    item_key,
+                    self.max_attempts,
+                    timestamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self.connection.execute(
+                "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
+                (job_kind, item_key),
             ).fetchone()
 
     def release_job(
@@ -827,6 +885,26 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"Lost job lease: {job_kind}/{item_key}")
+
+    def release_job_by_lease(
+        self,
+        job_kind: str,
+        lease_token: str,
+        *,
+        updated_at: str | None = None,
+    ) -> bool:
+        """Release interrupted work when only its preallocated lease token is known."""
+        with self.transaction():
+            cursor = self.connection.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'pending', attempt_count = MAX(0, attempt_count - 1),
+                    lease_token = NULL, next_attempt_at = NULL, updated_at = ?
+                WHERE job_kind = ? AND status = 'running' AND lease_token = ?
+                """,
+                (updated_at or _utc_now(), job_kind, lease_token),
+            )
+        return cursor.rowcount == 1
 
     def complete_job(
         self,

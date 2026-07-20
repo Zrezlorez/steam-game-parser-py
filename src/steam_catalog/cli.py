@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import wraps
 from pathlib import Path
+import secrets
 import sqlite3
 from typing import Annotated, Any, ParamSpec, TypeVar
 
@@ -144,47 +145,88 @@ def collect_command(
     settings: Settings = context.obj
     completed = 0
     failed = 0
+    active_lease_token: str | None = None
     del resume
-    with _database(settings) as database, _pipeline(database, settings) as pipeline:
-        if appid is not None:
-            try:
-                result = pipeline.collect_one(appid)
-            except KeyboardInterrupt as error:
-                typer.echo("Interrupted. Completed: 0")
-                raise typer.Exit(130) from error
-            typer.echo(f"{result.status.replace('_', '-')}: 1")
-            return
-
-        while limit is None or completed + failed < limit:
-            lease = database.claim_job("collect")
-            if lease is None:
-                break
-            item_key = lease["item_key"]
-            lease_token = lease["lease_token"]
-            try:
-                pipeline.collect_one(int(item_key), lease_token=lease_token)
-            except KeyboardInterrupt as error:
-                database.release_job("collect", item_key, expected_lease_token=lease_token)
-                typer.echo(f"Interrupted. Completed: {completed}; Failed: {failed}")
-                raise typer.Exit(130) from error
-            except _EXPECTED_ERRORS as error:
-                failed += 1
-                database.fail_job(
-                    "collect",
-                    item_key,
-                    error,
-                    expected_lease_token=lease_token,
-                    next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-                    max_attempts=settings.max_attempts,
+    try:
+        with _database(settings) as database, _pipeline(database, settings) as pipeline:
+            if appid is not None:
+                active_lease_token = secrets.token_urlsafe(32)
+                lease = database.claim_specific_job(
+                    "collect", str(appid), lease_token=active_lease_token
                 )
-                typer.echo(f"Failed appid {item_key}: {error}")
-            else:
-                completed += 1
+                if lease is None:
+                    active_lease_token = None
+                    result = pipeline.collect_one(appid)
+                else:
+                    try:
+                        result = pipeline.collect_one(appid, lease_token=active_lease_token)
+                    except _EXPECTED_ERRORS as error:
+                        database.fail_job(
+                            "collect",
+                            str(appid),
+                            error,
+                            expected_lease_token=active_lease_token,
+                            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                            max_attempts=settings.max_attempts,
+                        )
+                        active_lease_token = None
+                        raise
+                    active_lease_token = None
+                typer.echo(f"{result.status.replace('_', '-')}: 1")
+                return
+
+            while limit is None or completed + failed < limit:
+                active_lease_token = secrets.token_urlsafe(32)
+                lease = database.claim_job("collect", lease_token=active_lease_token)
+                if lease is None:
+                    active_lease_token = None
+                    break
+                item_key = lease["item_key"]
+                try:
+                    pipeline.collect_one(int(item_key), lease_token=active_lease_token)
+                except _EXPECTED_ERRORS as error:
+                    database.fail_job(
+                        "collect",
+                        item_key,
+                        error,
+                        expected_lease_token=active_lease_token,
+                        next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                        max_attempts=settings.max_attempts,
+                    )
+                    active_lease_token = None
+                    failed += 1
+                    typer.echo(f"Failed appid {item_key}: {error}")
+                else:
+                    active_lease_token = None
+                    completed += 1
+    except KeyboardInterrupt as error:
+        with _database(settings) as database:
+            if active_lease_token is not None:
+                database.release_job_by_lease("collect", active_lease_token)
+            completed, failed = _durable_collection_counts(database)
+        typer.echo(f"Interrupted. Completed: {completed}; Failed: {failed}")
+        raise typer.Exit(130) from error
 
     typer.echo(f"Completed: {completed}")
     typer.echo(f"Failed: {failed}")
     if failed:
         raise typer.Exit(1)
+
+
+def _durable_collection_counts(database: Database) -> tuple[int, int]:
+    row = database.connection.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END), 0) AS completed,
+            COALESCE(
+                SUM(CASE WHEN status IN ('failed', 'permanent_failure') THEN 1 ELSE 0 END),
+                0
+            ) AS failed
+        FROM sync_jobs
+        WHERE job_kind = 'collect'
+        """
+    ).fetchone()
+    return row["completed"], row["failed"]
 
 
 @app.command("refresh")

@@ -160,6 +160,26 @@ def test_claim_job_is_exclusive_due_and_increments_attempts(tmp_path):
         first.close()
 
 
+def test_claim_specific_job_claims_only_requested_due_job(initialized_db):
+    initialized_db.enqueue_job("collect", "10")
+    initialized_db.enqueue_job("collect", "11")
+
+    claimed = initialized_db.claim_specific_job(
+        "collect",
+        "11",
+        lease_token="specific-lease",
+        now="2026-07-20T00:00:00+00:00",
+    )
+
+    assert claimed is not None
+    assert (claimed["item_key"], claimed["status"], claimed["lease_token"]) == (
+        "11",
+        "running",
+        "specific-lease",
+    )
+    assert initialized_db.job_status("collect", "10") == "pending"
+
+
 def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
     initialized_db.enqueue_job("collect", "10", updated_at="2026-07-20T00:00:00+00:00")
     first_lease = initialized_db.claim_job("collect", now="2026-07-20T00:00:01+00:00")
