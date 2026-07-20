@@ -1,17 +1,21 @@
 """SQLite persistence and schema migration support."""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 
-from steam_catalog.models import DiscoveryItem, EligibilityStatus
+from steam_catalog.models import DiscoveryItem, EligibilityStatus, Review
 
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_ATTEMPTS = 3
+_SEARCH_TOKEN = re.compile(r"\w+", re.UNICODE)
+_SNIPPET_CONTEXT = 80
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS games (
@@ -452,6 +456,38 @@ class Database:
                 (rowid, appid, recommendation_id, review_text),
             )
 
+    def replace_review_samples(
+        self,
+        appid: int,
+        samples: Mapping[str, Sequence[Review]],
+        *,
+        fetched_at: str,
+    ) -> None:
+        """Replace sample memberships while storing each unique review once."""
+        unique_reviews: dict[str, Review] = {}
+        for reviews in samples.values():
+            for review in reviews:
+                if review.appid != appid:
+                    raise ValueError("sample review appid does not match collection appid")
+                unique_reviews.setdefault(review.recommendation_id, review)
+
+        with self.transaction():
+            self.connection.execute("DELETE FROM review_samples WHERE appid = ?", (appid,))
+            for review in unique_reviews.values():
+                self.upsert_review(**asdict(review), fetched_at=fetched_at)
+            for sample_kind, reviews in samples.items():
+                self.connection.executemany(
+                    """
+                    INSERT INTO review_samples(
+                        appid, recommendation_id, sample_kind, sample_rank
+                    ) VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        (appid, review.recommendation_id, sample_kind, rank)
+                        for rank, review in enumerate(reviews, start=1)
+                    ),
+                )
+
     def get_http_cache(self, cache_key: str) -> sqlite3.Row | None:
         """Return the cached response for a canonical request key, if present."""
         return self.connection.execute(
@@ -817,6 +853,96 @@ class Database:
             "SELECT COUNT(*) FROM reviews WHERE appid = ?", (appid,)
         ).fetchone()[0]
 
+    def search_games(self, query: str, limit: int) -> list[dict[str, object]]:
+        """Return BM25-ranked game matches with source-backed highlighted snippets."""
+        match_query, tokens = _quoted_match_query(query)
+        if not match_query or limit <= 0:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT
+                games.appid, games.name, bm25(game_search) AS rank,
+                games.short_description_text, games.detailed_description_text,
+                games.about_the_game_text, games.developers_json, games.publishers_json,
+                games.genres_json, games.categories_json
+            FROM game_search
+            JOIN games ON games.appid = game_search.rowid
+            WHERE game_search MATCH ?
+            ORDER BY rank, games.appid
+            LIMIT ?
+            """,
+            (match_query, limit),
+        ).fetchall()
+        return [
+            {
+                "appid": row["appid"],
+                "name": row["name"],
+                "rank": row["rank"],
+                "snippet": _highlighted_snippet(
+                    (
+                        row["name"],
+                        row["short_description_text"],
+                        row["detailed_description_text"],
+                        row["about_the_game_text"],
+                        row["developers_json"],
+                        row["publishers_json"],
+                        row["genres_json"],
+                        row["categories_json"],
+                    ),
+                    tokens,
+                ),
+            }
+            for row in rows
+        ]
+
+    def search_reviews(self, query: str, limit: int) -> list[dict[str, object]]:
+        """Return BM25-ranked review matches with game and sample context."""
+        match_query, tokens = _quoted_match_query(query)
+        if not match_query or limit <= 0:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT
+                reviews.appid, games.name, reviews.recommendation_id,
+                reviews.review_text, bm25(review_search) AS rank
+            FROM review_search
+            JOIN reviews ON reviews.rowid = review_search.rowid
+            JOIN games ON games.appid = reviews.appid
+            WHERE review_search MATCH ?
+            ORDER BY rank, reviews.recommendation_id
+            LIMIT ?
+            """,
+            (match_query, limit),
+        ).fetchall()
+        results = []
+        for row in rows:
+            memberships = self.connection.execute(
+                """
+                SELECT sample_kind, sample_rank
+                FROM review_samples
+                WHERE appid = ? AND recommendation_id = ?
+                ORDER BY sample_kind, sample_rank
+                """,
+                (row["appid"], row["recommendation_id"]),
+            ).fetchall()
+            results.append(
+                {
+                    "appid": row["appid"],
+                    "name": row["name"],
+                    "recommendation_id": row["recommendation_id"],
+                    "rank": row["rank"],
+                    "snippet": _highlighted_snippet((row["review_text"],), tokens),
+                    "samples": [
+                        {
+                            "sample_kind": membership["sample_kind"],
+                            "sample_rank": membership["sample_rank"],
+                        }
+                        for membership in memberships
+                    ],
+                }
+            )
+        return results
+
     def _delete_game_search_row(self, appid: int) -> None:
         self.connection.execute(
             """
@@ -892,3 +1018,34 @@ class Database:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _quoted_match_query(query: str) -> tuple[str, tuple[str, ...]]:
+    tokens = tuple(_SEARCH_TOKEN.findall(query))
+    return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens), tokens
+
+
+def _highlighted_snippet(values: Sequence[str | None], tokens: Sequence[str]) -> str:
+    token_pattern = re.compile(
+        rf"(?<!\w)(?:{'|'.join(re.escape(token) for token in tokens)})(?!\w)",
+        re.IGNORECASE,
+    )
+    text = next(
+        (value for value in values if value and token_pattern.search(value)),
+        next((value for value in values if value), ""),
+    )
+    match = token_pattern.search(text)
+    if match is None:
+        return text[:_SNIPPET_CONTEXT]
+
+    start = max(0, match.start() - _SNIPPET_CONTEXT)
+    end = min(len(text), match.end() + _SNIPPET_CONTEXT)
+    if start:
+        next_space = text.find(" ", start)
+        start = next_space + 1 if next_space >= 0 and next_space < match.start() else start
+    if end < len(text):
+        previous_space = text.rfind(" ", match.end(), end)
+        end = previous_space if previous_space >= match.end() else end
+    fragment = text[start:end]
+    highlighted = token_pattern.sub(lambda found: f"<mark>{found.group(0)}</mark>", fragment)
+    return f"{'... ' if start else ''}{highlighted}{' ...' if end < len(text) else ''}"

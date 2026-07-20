@@ -2,10 +2,39 @@
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Literal, Protocol, TypeAlias, cast
 
 from steam_catalog.db import Database
-from steam_catalog.models import DiscoveryItem, GameDetails, ReviewPage
+from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
+
+
+Polarity: TypeAlias = Literal["positive", "negative"]
+SampleKind: TypeAlias = Literal[
+    "helpful_positive",
+    "helpful_negative",
+    "recent_positive",
+    "recent_negative",
+]
+
+
+def select_reviews(
+    reviews: tuple[Review, ...] | list[Review], polarity: Polarity, limit: int = 5
+) -> list[Review]:
+    """Select unique reviews of one polarity without changing response order."""
+    if limit < 0:
+        raise ValueError("limit must not be negative")
+    if limit == 0:
+        return []
+    voted_up = polarity == "positive"
+    selected: list[Review] = []
+    seen: set[str] = set()
+    for review in reviews:
+        if review.voted_up == voted_up and review.recommendation_id not in seen:
+            selected.append(review)
+            seen.add(review.recommendation_id)
+            if len(selected) == limit:
+                break
+    return selected
 
 
 class SteamProvider(Protocol):
@@ -140,10 +169,33 @@ class CatalogPipeline:
                 appid, details, "unreleased", timestamp, aggregate, lease_token
             )
 
+        samples = self.collect_review_samples(appid, summary)
         with self.database.transaction():
             self._store_details(details, "eligible", None, timestamp, aggregate)
+            self.database.replace_review_samples(appid, samples, fetched_at=timestamp)
             self._complete_job(appid, lease_token, timestamp)
         return CollectionResult(appid, "eligible")
+
+    def collect_review_samples(
+        self, appid: int, summary: ReviewPage
+    ) -> dict[SampleKind, list[Review]]:
+        """Collect broad helpful/recent pages with targeted shortfall fallbacks."""
+        samples: dict[SampleKind, list[Review]] = {}
+        aggregate_counts = {
+            "positive": summary.total_positive,
+            "negative": summary.total_negative,
+        }
+        for sample_prefix, filter_name in (("helpful", "all"), ("recent", "recent")):
+            broad = self.steam.fetch_reviews(appid, filter_name, "all", 100)
+            for polarity in ("positive", "negative"):
+                target = min(5, aggregate_counts[polarity])
+                selected = select_reviews(broad.reviews, polarity, target)
+                if len(selected) < target:
+                    targeted = self.steam.fetch_reviews(appid, filter_name, polarity, 5)
+                    selected = select_reviews([*selected, *targeted.reviews], polarity, target)
+                sample_kind = cast(SampleKind, f"{sample_prefix}_{polarity}")
+                samples[sample_kind] = selected
+        return samples
 
     def _record_skip(
         self,
