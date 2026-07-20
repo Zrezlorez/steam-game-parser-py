@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -491,6 +492,57 @@ def test_bootstrap_page_rolls_back_as_one_resumable_unit(pipeline_factory, monke
     assert db.connection.execute("SELECT COUNT(*) FROM source_items").fetchone()[0] == 0
     assert db.connection.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
     assert db.connection.execute("SELECT COUNT(*) FROM sync_jobs").fetchone()[0] == 0
+    assert pipeline.bootstrap_progress == RunStats()
+
+
+def test_bootstrap_interrupt_after_page_commit_publishes_full_progress(
+    pipeline_factory, monkeypatch
+):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20), item(11, 19)]])
+    transaction = db.transaction
+
+    @contextmanager
+    def interrupt_after_outer_commit(*args, **kwargs):
+        outermost = not db.connection.in_transaction
+        with transaction(*args, **kwargs):
+            yield
+        if outermost:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(db, "transaction", interrupt_after_outer_commit)
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.bootstrap("steamspy", page_limit=1)
+
+    assert db.connection.execute("SELECT COUNT(*) FROM source_items").fetchone()[0] == 2
+    assert db.job_status("collect", "10") == "pending"
+    assert db.game_status(11) == "below_provisional_threshold"
+    assert pipeline.bootstrap_progress == RunStats(discovered=2, queued=1)
+
+
+def test_bootstrap_interrupt_between_page_progress_sets_finishes_publication(
+    pipeline_factory,
+):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 20), item(11, 19)]])
+
+    class InterruptOnceAfterUpdate(set):
+        interrupted = False
+
+        def update(self, values):
+            super().update(values)
+            if not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+
+    pipeline._bootstrap_discovered_appids = InterruptOnceAfterUpdate()
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.bootstrap("steamspy", page_limit=1)
+
+    assert db.connection.execute("SELECT COUNT(*) FROM source_items").fetchone()[0] == 2
+    assert db.job_status("collect", "10") == "pending"
+    assert db.game_status(11) == "below_provisional_threshold"
+    assert pipeline.bootstrap_progress == RunStats(discovered=2, queued=1)
 
 
 def test_provisional_refresh_removes_stale_collect_job(pipeline_factory):

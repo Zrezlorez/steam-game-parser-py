@@ -108,7 +108,11 @@ class CatalogPipeline:
             timestamp = _utc_now()
             page_discovered_appids: set[int] = set()
             page_queued_appids: set[int] = set()
-            with self.database.transaction():
+            with self.database.transaction(
+                on_commit=lambda: self._publish_bootstrap_page(
+                    page_discovered_appids, page_queued_appids
+                )
+            ):
                 for candidate in items:
                     page_discovered_appids.add(candidate.appid)
                     is_verified = self.database.has_authoritative_verification(candidate.appid)
@@ -154,10 +158,12 @@ class CatalogPipeline:
                             )
                         page_queued_appids.add(candidate.appid)
 
-            self._bootstrap_discovered_appids.update(page_discovered_appids)
-            self._bootstrap_queued_appids.update(page_queued_appids)
-
         return self.bootstrap_progress
+
+    def _publish_bootstrap_page(self, discovered_appids: set[int], queued_appids: set[int]) -> None:
+        """Publish one committed page; safe to replay after interruption."""
+        self._bootstrap_discovered_appids.update(discovered_appids)
+        self._bootstrap_queued_appids.update(queued_appids)
 
     def collect_one(self, appid: int, *, lease_token: str | None = None) -> CollectionResult:
         """Verify eligibility first, then persist one app's store metadata."""

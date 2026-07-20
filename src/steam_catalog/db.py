@@ -1,6 +1,6 @@
 """SQLite persistence and schema migration support."""
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -210,9 +210,11 @@ class Database:
         self._recover_stale_jobs()
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
-        """Run a group of writes atomically using SQLite's immediate lock mode."""
+    def transaction(self, *, on_commit: Callable[[], None] | None = None) -> Iterator[None]:
+        """Run writes atomically, optionally publishing state after the outer commit."""
         if self.connection.in_transaction:
+            if on_commit is not None:
+                raise RuntimeError("on_commit requires an outermost transaction")
             self._savepoint_counter += 1
             savepoint = f"steam_catalog_{self._savepoint_counter}"
             self.connection.execute(f"SAVEPOINT {savepoint}")
@@ -233,7 +235,44 @@ class Database:
             self.connection.rollback()
             raise
         else:
+            self._commit_and_publish(on_commit)
+
+    def _commit_and_publish(self, on_commit: Callable[[], None] | None) -> None:
+        if on_commit is None:
             self.connection.commit()
+            return
+
+        committed = False
+        interrupted: KeyboardInterrupt | None = None
+        try:
+            try:
+                self.connection.commit()
+                committed = True
+            except KeyboardInterrupt as error:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                    raise
+                committed = True
+                interrupted = error
+        finally:
+            if committed:
+                interrupted = self._finish_post_commit(on_commit, interrupted)
+
+        if interrupted is not None:
+            raise interrupted
+
+    @staticmethod
+    def _finish_post_commit(
+        on_commit: Callable[[], None], interrupted: KeyboardInterrupt | None
+    ) -> KeyboardInterrupt | None:
+        """Finish an idempotent publication before replaying an interrupt."""
+        while True:
+            try:
+                on_commit()
+            except KeyboardInterrupt as error:
+                interrupted = interrupted or error
+            else:
+                return interrupted
 
     def upsert_game(
         self,
