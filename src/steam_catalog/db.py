@@ -642,15 +642,13 @@ class Database:
                     UPDATE games
                     SET name = ?,
                         steamspy_positive = COALESCE(?, steamspy_positive),
-                        steamspy_negative = COALESCE(?, steamspy_negative),
-                        updated_at = ?
+                        steamspy_negative = COALESCE(?, steamspy_negative)
                     WHERE appid = ?
                     """,
                     (
                         name,
                         item.steamspy_positive,
                         item.steamspy_negative,
-                        timestamp,
                         item.appid,
                     ),
                 )
@@ -720,7 +718,7 @@ class Database:
         include_failed: bool = False,
         updated_at: str | None = None,
     ) -> int:
-        """Queue stale games and, when requested, permanently failed collect jobs."""
+        """Queue games with stale or unknown authoritative Steam verification."""
         timestamp = updated_at or _utc_now()
         with self.transaction():
             rows = self.connection.execute(
@@ -731,7 +729,10 @@ class Database:
                   ON sync_jobs.job_kind = 'collect'
                  AND sync_jobs.item_key = CAST(games.appid AS TEXT)
                 WHERE (
-                        julianday(games.updated_at) < julianday(?)
+                        (
+                            games.reviews_fetched_at IS NULL
+                            OR julianday(games.reviews_fetched_at) < julianday(?)
+                        )
                     AND COALESCE(sync_jobs.status, '') NOT IN ('running', 'permanent_failure')
                 ) OR (? AND sync_jobs.status = 'permanent_failure')
                 ORDER BY games.appid
@@ -850,6 +851,42 @@ class Database:
                     self.max_attempts,
                     timestamp,
                 ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self.connection.execute(
+                "SELECT * FROM sync_jobs WHERE job_kind = ? AND item_key = ?",
+                (job_kind, item_key),
+            ).fetchone()
+
+    def requeue_and_claim_specific_job(
+        self,
+        job_kind: str,
+        item_key: str,
+        *,
+        now: str | None = None,
+        lease_token: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Reset and claim one explicit target unless another worker owns it."""
+        timestamp = now or _utc_now()
+        selected_lease_token = lease_token or secrets.token_urlsafe(32)
+        with self.transaction():
+            cursor = self.connection.execute(
+                """
+                INSERT INTO sync_jobs(
+                    job_kind, item_key, status, attempt_count, next_attempt_at,
+                    last_error, updated_at, lease_token
+                ) VALUES(?, ?, 'running', 1, NULL, NULL, ?, ?)
+                ON CONFLICT(job_kind, item_key) DO UPDATE SET
+                    status = 'running',
+                    attempt_count = 1,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at,
+                    lease_token = excluded.lease_token
+                WHERE sync_jobs.status <> 'running'
+                """,
+                (job_kind, item_key, timestamp, selected_lease_token),
             )
             if cursor.rowcount != 1:
                 return None
@@ -1052,6 +1089,19 @@ class Database:
             (job_kind, item_key),
         ).fetchone()
         return None if row is None else row["status"]
+
+    def has_authoritative_verification(self, appid: int) -> bool:
+        """Return whether Steam-owned review data proves prior verification."""
+        row = self.connection.execute(
+            """
+            SELECT 1
+            FROM games
+            WHERE appid = ?
+              AND (reviews_fetched_at IS NOT NULL OR steam_total_reviews IS NOT NULL)
+            """,
+            (appid,),
+        ).fetchone()
+        return row is not None
 
     def game_status(self, appid: int) -> str | None:
         row = self.connection.execute(

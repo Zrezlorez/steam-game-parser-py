@@ -8,6 +8,9 @@ from steam_catalog.db import Database
 from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
 
 
+MIN_REVIEWS = 20
+
+
 Polarity: TypeAlias = Literal["positive", "negative"]
 SampleKind: TypeAlias = Literal[
     "helpful_positive",
@@ -73,12 +76,10 @@ class CatalogPipeline:
         *,
         steam: SteamProvider,
         steamspy: SteamSpyProvider,
-        min_reviews: int = 20,
     ) -> None:
         self.database = database
         self.steam = steam
         self.steamspy = steamspy
-        self.min_reviews = min_reviews
 
     def bootstrap(
         self,
@@ -104,9 +105,11 @@ class CatalogPipeline:
                         source_page=source_page,
                         fetched_at=timestamp,
                     )
+                    is_verified = self.database.has_authoritative_verification(candidate.appid)
                     if (
                         candidate.provisional_reviews is not None
-                        and candidate.provisional_reviews < self.min_reviews
+                        and candidate.provisional_reviews < MIN_REVIEWS
+                        and not is_verified
                     ):
                         self.database.record_game_status(
                             candidate.appid,
@@ -124,11 +127,12 @@ class CatalogPipeline:
                         "collect", str(candidate.appid), resume=resume, updated_at=timestamp
                     )
                     if enqueued:
-                        self.database.record_game_status(
-                            candidate.appid,
-                            "pending",
-                            updated_at=timestamp,
-                        )
+                        if not is_verified:
+                            self.database.record_game_status(
+                                candidate.appid,
+                                "pending",
+                                updated_at=timestamp,
+                            )
                         queued += 1
 
         return RunStats(discovered=discovered, queued=queued)
@@ -147,7 +151,7 @@ class CatalogPipeline:
             "review_score_desc": summary.review_score_desc,
             "reviews_fetched_at": timestamp,
         }
-        if summary.total_reviews < self.min_reviews:
+        if summary.total_reviews < MIN_REVIEWS:
             with self.database.transaction():
                 self.database.record_game_status(
                     appid,

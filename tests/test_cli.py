@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from steam_catalog.cli import app
 from steam_catalog.db import Database
+from steam_catalog.models import DiscoveryItem
 from steam_catalog.pipeline import CollectionResult, RunStats
 
 
@@ -53,6 +54,23 @@ def test_help_lists_exact_command_surface():
         "export",
     ):
         assert command in result.stdout
+
+
+def test_collect_help_does_not_advertise_unsupported_resume_switches():
+    result = runner.invoke(app, ["collect", "--help"])
+
+    assert result.exit_code == 0
+    assert "--resume" not in result.stdout
+    assert "--no-resume" not in result.stdout
+
+
+def test_collect_rejects_removed_no_resume_option(tmp_path: Path):
+    result = runner.invoke(
+        app,
+        ["--database", str(tmp_path / "catalog.sqlite3"), "collect", "--no-resume"],
+    )
+
+    assert result.exit_code == 2
 
 
 @pytest.mark.parametrize(
@@ -130,9 +148,18 @@ def test_status_initializes_missing_database(tmp_path: Path):
 def test_refresh_schedules_only_old_rows_and_optionally_permanent_failures(tmp_path: Path):
     path = tmp_path / "refresh.sqlite3"
     database = _open_database(path)
-    database.record_game_status(10, "eligible", updated_at="2000-01-01T00:00:00+00:00")
-    database.record_game_status(11, "eligible", updated_at="2999-01-01T00:00:00+00:00")
-    database.record_game_status(12, "ineligible", updated_at="2999-01-01T00:00:00+00:00")
+    for appid, status, fetched_at in (
+        (10, "eligible", "2000-01-01T00:00:00+00:00"),
+        (11, "eligible", "2999-01-01T00:00:00+00:00"),
+        (12, "ineligible", "2999-01-01T00:00:00+00:00"),
+    ):
+        database.record_game_status(
+            appid,
+            status,
+            reviews_fetched_at=fetched_at,
+            replace_steam_aggregate=True,
+            updated_at=fetched_at,
+        )
     database.enqueue_job("collect", "12")
     database.connection.execute(
         "UPDATE sync_jobs SET status = 'permanent_failure' WHERE item_key = '12'"
@@ -270,9 +297,51 @@ def test_bootstrap_keyboard_interrupt_reports_progress_and_exits_130(tmp_path: P
     assert "queued: 0" in result.stdout.lower()
 
 
+def test_bootstrap_interrupt_reports_current_run_deltas_not_historical_totals(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "bootstrap-history.sqlite3"
+    database = _open_database(path)
+    database.upsert_source_item(
+        "steamspy",
+        DiscoveryItem(appid=1, name="Historical", payload_json='{"appid":1}'),
+    )
+    for item_key, status in (("1", "complete"), ("2", "permanent_failure"), ("3", "pending")):
+        database.enqueue_job("collect", item_key)
+        database.connection.execute(
+            "UPDATE sync_jobs SET status = ? WHERE item_key = ?", (status, item_key)
+        )
+    database.close()
+
+    @contextmanager
+    def fake_pipeline(database, settings):
+        class InterruptingPipeline:
+            def bootstrap(self, source: str, *, resume: bool, page_limit: int | None):
+                database.upsert_source_item(
+                    source,
+                    DiscoveryItem(appid=4, name="Current", payload_json='{"appid":4}'),
+                )
+                database.enqueue_job("collect", "4")
+                raise KeyboardInterrupt
+
+        yield InterruptingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(app, ["--database", str(path), "bootstrap"])
+
+    assert result.exit_code == 130
+    assert "discovered: 1" in result.stdout.lower()
+    assert "queued: 1" in result.stdout.lower()
+
+
 def test_collect_keyboard_interrupt_releases_job_and_exits_130(tmp_path: Path, monkeypatch):
     path = tmp_path / "interrupt.sqlite3"
     database = _open_database(path)
+    database.enqueue_job("collect", "8")
+    database.connection.execute("UPDATE sync_jobs SET status = 'complete' WHERE item_key = '8'")
+    database.enqueue_job("collect", "9")
+    database.connection.execute("UPDATE sync_jobs SET status = 'failed' WHERE item_key = '9'")
     database.enqueue_job("collect", "10")
     database.close()
 
@@ -288,7 +357,7 @@ def test_collect_keyboard_interrupt_releases_job_and_exits_130(tmp_path: Path, m
 
     result = runner.invoke(
         app,
-        ["--database", str(path), "collect", "--limit", "1", "--resume"],
+        ["--database", str(path), "collect", "--limit", "1"],
     )
 
     assert result.exit_code == 130
@@ -318,7 +387,7 @@ def test_collect_interrupt_after_committed_claim_recovers_active_lease(tmp_path:
 
     result = runner.invoke(
         app,
-        ["--database", str(path), "collect", "--limit", "1", "--resume"],
+        ["--database", str(path), "collect", "--limit", "1"],
     )
 
     assert result.exit_code == 130
@@ -336,6 +405,14 @@ def test_collect_interrupt_after_failure_persistence_reports_durable_counts(
 ):
     path = tmp_path / "failure-interrupt.sqlite3"
     database = _open_database(path)
+    database.enqueue_job("collect", "9")
+    database.connection.execute(
+        """
+        UPDATE sync_jobs
+        SET status = 'failed', next_attempt_at = '2999-01-01T00:00:00Z'
+        WHERE item_key = '9'
+        """
+    )
     database.enqueue_job("collect", "10")
     database.close()
     fail_job = Database.fail_job
@@ -357,7 +434,7 @@ def test_collect_interrupt_after_failure_persistence_reports_durable_counts(
 
     result = runner.invoke(
         app,
-        ["--database", str(path), "collect", "--limit", "1", "--resume"],
+        ["--database", str(path), "collect", "--limit", "1"],
     )
 
     assert result.exit_code == 130
@@ -375,6 +452,8 @@ def test_collect_interrupt_during_pipeline_cleanup_reports_durable_completion(
 ):
     path = tmp_path / "cleanup-interrupt.sqlite3"
     database = _open_database(path)
+    database.enqueue_job("collect", "9")
+    database.connection.execute("UPDATE sync_jobs SET status = 'complete' WHERE item_key = '9'")
     database.enqueue_job("collect", "10")
     database.close()
 
@@ -392,7 +471,7 @@ def test_collect_interrupt_during_pipeline_cleanup_reports_durable_completion(
 
     result = runner.invoke(
         app,
-        ["--database", str(path), "collect", "--limit", "1", "--resume"],
+        ["--database", str(path), "collect", "--limit", "1"],
     )
 
     assert result.exit_code == 130
@@ -402,11 +481,27 @@ def test_collect_interrupt_during_pipeline_cleanup_reports_durable_completion(
     database.close()
 
 
-def test_collect_appid_claims_only_queued_target(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize(
+    "initial_status",
+    [None, "pending", "failed", "complete", "permanent_failure"],
+)
+def test_collect_appid_requeues_and_claims_exact_target(
+    tmp_path: Path, monkeypatch, initial_status: str | None
+):
     path = tmp_path / "target.sqlite3"
     database = _open_database(path)
     database.enqueue_job("collect", "10")
-    database.enqueue_job("collect", "11")
+    if initial_status is not None:
+        database.enqueue_job("collect", "11")
+        database.connection.execute(
+            """
+            UPDATE sync_jobs
+            SET status = ?, attempt_count = 2, next_attempt_at = '2999-01-01T00:00:00Z',
+                last_error = 'old failure'
+            WHERE item_key = '11'
+            """,
+            (initial_status,),
+        )
     database.close()
     observed_lease: list[str] = []
 
@@ -434,13 +529,70 @@ def test_collect_appid_claims_only_queued_target(tmp_path: Path, monkeypatch):
     database = _open_database(path)
     assert database.job_status("collect", "10") == "pending"
     assert database.job_status("collect", "11") == "complete"
+    assert (
+        database.connection.execute(
+            "SELECT attempt_count FROM sync_jobs WHERE item_key = '11'"
+        ).fetchone()[0]
+        == 1
+    )
+    database.close()
+
+
+def test_collect_appid_does_not_steal_running_target(tmp_path: Path, monkeypatch):
+    path = tmp_path / "running-target.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "10")
+    lease = database.claim_job("collect", lease_token="existing-lease")
+    database.close()
+
+    @contextmanager
+    def unused_pipeline(*args, **kwargs):
+        raise AssertionError("running target must not be collected")
+        yield
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", unused_pipeline)
+
+    result = runner.invoke(app, ["--database", str(path), "collect", "--appid", "10"])
+
+    assert result.exit_code == 1
+    assert "already running" in result.stdout.lower()
+    database = _open_database(path)
+    row = database.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", lease["attempt_count"], "existing-lease")
+    database.close()
+
+
+def test_collect_appid_failure_uses_bounded_job_failure_lifecycle(tmp_path: Path, monkeypatch):
+    path = tmp_path / "direct-failure.sqlite3"
+
+    class FailingPipeline:
+        def collect_one(self, appid: int, *, lease_token: str | None = None):
+            assert lease_token is not None
+            raise ValueError("source failed")
+
+    @contextmanager
+    def fake_pipeline(*args, **kwargs):
+        yield FailingPipeline()
+
+    monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)
+
+    result = runner.invoke(app, ["--database", str(path), "collect", "--appid", "4000"])
+
+    assert result.exit_code == 1
+    database = _open_database(path)
+    row = database.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '4000'"
+    ).fetchone()
+    assert tuple(row) == ("failed", 1, None)
     database.close()
 
 
 def test_collect_direct_appid_interrupt_reports_zero_durable_counts(tmp_path: Path, monkeypatch):
     class InterruptingPipeline:
         def collect_one(self, appid: int, *, lease_token: str | None = None):
-            assert lease_token is None
+            assert lease_token is not None
             raise KeyboardInterrupt
 
     @contextmanager
@@ -457,23 +609,34 @@ def test_collect_direct_appid_interrupt_reports_zero_durable_counts(tmp_path: Pa
     assert result.exit_code == 130
     assert "completed: 0" in result.stdout.lower()
     assert "failed: 0" in result.stdout.lower()
+    database = _open_database(tmp_path / "direct.sqlite3")
+    row = database.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '4000'"
+    ).fetchone()
+    assert tuple(row) == ("pending", 0, None)
+    database.close()
 
 
 def test_collect_direct_appid_commit_then_cleanup_interrupt_reports_completion(
     tmp_path: Path, monkeypatch
 ):
     path = tmp_path / "direct-complete.sqlite3"
+    database = _open_database(path)
+    database.enqueue_job("collect", "4000")
+    database.connection.execute("UPDATE sync_jobs SET status = 'complete' WHERE item_key = '4000'")
+    database.close()
 
     @contextmanager
     def interrupting_pipeline(database, settings):
         class CompletingPipeline:
             def collect_one(self, appid: int, *, lease_token: str | None = None):
-                assert lease_token is None
+                assert lease_token is not None
                 database.record_game_status(
                     appid,
                     "eligible",
                     updated_at="2026-07-20T00:00:00+00:00",
                 )
+                database.complete_job("collect", str(appid), expected_lease_token=lease_token)
                 return CollectionResult(appid=appid, status="eligible")
 
         yield CompletingPipeline()
@@ -491,18 +654,20 @@ def test_collect_direct_appid_commit_then_cleanup_interrupt_reports_completion(
     assert "failed: 0" in result.stdout.lower()
     database = _open_database(path)
     assert database.game_status(4000) == "eligible"
-    assert database.job_status("collect", "4000") is None
+    assert database.job_status("collect", "4000") == "complete"
     database.close()
 
 
 def test_collect_appid_delegates_without_review_text(tmp_path: Path, monkeypatch):
-    class FakePipeline:
-        def collect_one(self, appid: int, *, lease_token: str | None = None):
-            assert (appid, lease_token) == (4000, None)
-            return CollectionResult(appid=appid, status="eligible")
-
     @contextmanager
-    def fake_pipeline(*args, **kwargs):
+    def fake_pipeline(database, settings):
+        class FakePipeline:
+            def collect_one(self, appid: int, *, lease_token: str | None = None):
+                assert appid == 4000
+                assert lease_token is not None
+                database.complete_job("collect", str(appid), expected_lease_token=lease_token)
+                return CollectionResult(appid=appid, status="eligible")
+
         yield FakePipeline()
 
     monkeypatch.setattr("steam_catalog.cli._pipeline", fake_pipeline)

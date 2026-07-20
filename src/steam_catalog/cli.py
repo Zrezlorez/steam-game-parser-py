@@ -89,7 +89,6 @@ def _pipeline(database: Database, settings: Settings) -> Iterator[CatalogPipelin
             database,
             steam=SteamClient(http),
             steamspy=SteamSpyClient(http),
-            min_reviews=settings.min_reviews,
         )
     finally:
         http.close()
@@ -114,17 +113,17 @@ def bootstrap_command(
 ) -> None:
     """Discover catalog candidates and queue eligible collection work."""
     settings: Settings = context.obj
+    starting_progress = (0, 0)
     try:
-        with _database(settings) as database, _pipeline(database, settings) as pipeline:
-            stats = pipeline.bootstrap(source.value, resume=resume, page_limit=page_limit)
+        with _database(settings) as database:
+            starting_progress = _bootstrap_progress_totals(database, source.value)
+            with _pipeline(database, settings) as pipeline:
+                stats = pipeline.bootstrap(source.value, resume=resume, page_limit=page_limit)
     except KeyboardInterrupt as error:
         with _database(settings) as database:
-            discovered = database.connection.execute(
-                "SELECT COUNT(*) FROM source_items WHERE source = ?", (source.value,)
-            ).fetchone()[0]
-            queued = database.connection.execute(
-                "SELECT COUNT(*) FROM sync_jobs WHERE job_kind = 'collect'"
-            ).fetchone()[0]
+            current_progress = _bootstrap_progress_totals(database, source.value)
+        discovered = max(0, current_progress[0] - starting_progress[0])
+        queued = max(0, current_progress[1] - starting_progress[1])
         typer.echo("Interrupted; completed discovery pages remain resumable.")
         typer.echo(f"Discovered: {discovered}")
         typer.echo(f"Queued: {queued}")
@@ -139,80 +138,98 @@ def collect_command(
     context: typer.Context,
     limit: Annotated[int | None, typer.Option("--limit", min=1)] = None,
     appid: Annotated[int | None, typer.Option("--appid", min=1)] = None,
-    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = True,
 ) -> None:
     """Collect one app or consume resumable queued work."""
     settings: Settings = context.obj
     completed = 0
     failed = 0
     active_lease_token: str | None = None
-    direct_appid_for_progress: int | None = None
-    direct_game_before: tuple[object, ...] | None = None
-    del resume
+    active_item_key: str | None = None
+    direct_claimed = False
+    direct_status_before: str | None = None
+    starting_job_totals = (0, 0)
     try:
-        with _database(settings) as database, _pipeline(database, settings) as pipeline:
+        with _database(settings) as database:
+            starting_job_totals = _collection_job_totals(database)
             if appid is not None:
+                item_key = str(appid)
+                direct_status_before = database.job_status("collect", item_key)
                 active_lease_token = secrets.token_urlsafe(32)
-                lease = database.claim_specific_job(
-                    "collect", str(appid), lease_token=active_lease_token
+                active_item_key = item_key
+                lease = database.requeue_and_claim_specific_job(
+                    "collect", item_key, lease_token=active_lease_token
                 )
                 if lease is None:
-                    if database.job_status("collect", str(appid)) is None:
-                        direct_appid_for_progress = appid
-                        direct_game_before = _game_collection_fingerprint(database, appid)
                     active_lease_token = None
-                    result = pipeline.collect_one(appid)
-                else:
+                    active_item_key = None
+                    raise ValueError(f"Collect job for appid {appid} is already running")
+                direct_claimed = True
+                with _pipeline(database, settings) as pipeline:
                     try:
                         result = pipeline.collect_one(appid, lease_token=active_lease_token)
                     except _EXPECTED_ERRORS as error:
                         database.fail_job(
                             "collect",
-                            str(appid),
+                            item_key,
                             error,
                             expected_lease_token=active_lease_token,
                             next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                             max_attempts=settings.max_attempts,
                         )
                         active_lease_token = None
+                        active_item_key = None
                         raise
-                    active_lease_token = None
+                active_lease_token = None
+                active_item_key = None
                 typer.echo(f"{result.status.replace('_', '-')}: 1")
                 return
 
-            while limit is None or completed + failed < limit:
-                active_lease_token = secrets.token_urlsafe(32)
-                lease = database.claim_job("collect", lease_token=active_lease_token)
-                if lease is None:
-                    active_lease_token = None
-                    break
-                item_key = lease["item_key"]
-                try:
-                    pipeline.collect_one(int(item_key), lease_token=active_lease_token)
-                except _EXPECTED_ERRORS as error:
-                    database.fail_job(
-                        "collect",
-                        item_key,
-                        error,
-                        expected_lease_token=active_lease_token,
-                        next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-                        max_attempts=settings.max_attempts,
-                    )
-                    active_lease_token = None
-                    failed += 1
-                    typer.echo(f"Failed appid {item_key}: {error}")
-                else:
-                    active_lease_token = None
-                    completed += 1
+            with _pipeline(database, settings) as pipeline:
+                while limit is None or completed + failed < limit:
+                    active_lease_token = secrets.token_urlsafe(32)
+                    lease = database.claim_job("collect", lease_token=active_lease_token)
+                    if lease is None:
+                        active_lease_token = None
+                        break
+                    item_key = lease["item_key"]
+                    active_item_key = item_key
+                    try:
+                        pipeline.collect_one(int(item_key), lease_token=active_lease_token)
+                    except _EXPECTED_ERRORS as error:
+                        database.fail_job(
+                            "collect",
+                            item_key,
+                            error,
+                            expected_lease_token=active_lease_token,
+                            next_attempt_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                            max_attempts=settings.max_attempts,
+                        )
+                        failed += 1
+                        active_lease_token = None
+                        active_item_key = None
+                        typer.echo(f"Failed appid {item_key}: {error}")
+                    else:
+                        completed += 1
+                        active_lease_token = None
+                        active_item_key = None
     except KeyboardInterrupt as error:
+        active_completed = 0
+        active_failed = 0
         with _database(settings) as database:
             if active_lease_token is not None:
-                database.release_job_by_lease("collect", active_lease_token)
-            completed, failed = _durable_collection_counts(
+                released = database.release_job_by_lease("collect", active_lease_token)
+                if not released and active_item_key is not None:
+                    active_status = database.job_status("collect", active_item_key)
+                    active_completed = int(active_status == "complete")
+                    active_failed = int(active_status in {"failed", "permanent_failure"})
+            durable_completed, durable_failed = _durable_collection_deltas(
                 database,
-                direct_appid=direct_appid_for_progress,
-                direct_game_before=direct_game_before,
+                starting_job_totals,
+                direct_status_before=direct_status_before,
+                direct_claimed=direct_claimed,
             )
+        completed = max(completed + active_completed, durable_completed)
+        failed = max(failed + active_failed, durable_failed)
         typer.echo(f"Interrupted. Completed: {completed}; Failed: {failed}")
         raise typer.Exit(130) from error
 
@@ -222,48 +239,47 @@ def collect_command(
         raise typer.Exit(1)
 
 
-def _durable_collection_counts(
-    database: Database,
-    *,
-    direct_appid: int | None = None,
-    direct_game_before: tuple[object, ...] | None = None,
-) -> tuple[int, int]:
+def _bootstrap_progress_totals(database: Database, source: str) -> tuple[int, int]:
+    discovered = database.connection.execute(
+        "SELECT COUNT(*) FROM source_items WHERE source = ?", (source,)
+    ).fetchone()[0]
+    queued = database.connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM sync_jobs
+        WHERE job_kind = 'collect' AND status IN ('pending', 'failed')
+        """
+    ).fetchone()[0]
+    return discovered, queued
+
+
+def _collection_job_totals(database: Database) -> tuple[int, int]:
     row = database.connection.execute(
         """
         SELECT
-            COALESCE(SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END), 0) AS completed,
-            COALESCE(
-                SUM(CASE WHEN status IN ('failed', 'permanent_failure') THEN 1 ELSE 0 END),
-                0
-            ) AS failed
+            COALESCE(SUM(status = 'complete'), 0) AS completed,
+            COALESCE(SUM(status IN ('failed', 'permanent_failure')), 0) AS failed
         FROM sync_jobs
         WHERE job_kind = 'collect'
         """
     ).fetchone()
-    completed = row["completed"]
-    if direct_appid is not None:
-        direct_game_after = _game_collection_fingerprint(database, direct_appid)
-        direct_job_status = database.job_status("collect", str(direct_appid))
-        if (
-            direct_game_after is not None
-            and direct_game_after != direct_game_before
-            and direct_game_after[0] in {"eligible", "below_verified_threshold", "ineligible"}
-            and direct_job_status != "complete"
-        ):
-            completed += 1
-    return completed, row["failed"]
+    return row["completed"], row["failed"]
 
 
-def _game_collection_fingerprint(database: Database, appid: int) -> tuple[object, ...] | None:
-    row = database.connection.execute(
-        """
-        SELECT eligibility_status, updated_at, metadata_fetched_at, reviews_fetched_at
-        FROM games
-        WHERE appid = ?
-        """,
-        (appid,),
-    ).fetchone()
-    return None if row is None else tuple(row)
+def _durable_collection_deltas(
+    database: Database,
+    starting_totals: tuple[int, int],
+    *,
+    direct_status_before: str | None = None,
+    direct_claimed: bool = False,
+) -> tuple[int, int]:
+    ending_totals = _collection_job_totals(database)
+    completed = ending_totals[0] - starting_totals[0]
+    failed = ending_totals[1] - starting_totals[1]
+    if direct_claimed:
+        completed += int(direct_status_before == "complete")
+        failed += int(direct_status_before in {"failed", "permanent_failure"})
+    return max(0, completed), max(0, failed)
 
 
 @app.command("refresh")

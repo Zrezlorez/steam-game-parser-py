@@ -13,7 +13,6 @@ class Settings:
     """Runtime settings for the Steam catalog collector."""
 
     database: Path
-    min_reviews: int
     request_timeout_seconds: float
     steam_interval_seconds: float
     steamspy_interval_seconds: float
@@ -50,7 +49,6 @@ class Settings:
 
         return cls(
             database=selected_database.resolve(),
-            min_reviews=_int_env("MIN_REVIEWS", 20),
             request_timeout_seconds=request_timeout_seconds,
             steam_interval_seconds=steam_interval_seconds,
             steamspy_interval_seconds=steamspy_interval_seconds,

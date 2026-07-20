@@ -95,7 +95,6 @@ def pipeline_factory(tmp_path):
                 app_list=app_list,
             ),
             steamspy=FakeSteamSpyClient(steamspy_pages or []),
-            min_reviews=20,
         )
         return pipeline, database
 
@@ -178,6 +177,56 @@ def test_claim_specific_job_claims_only_requested_due_job(initialized_db):
         "specific-lease",
     )
     assert initialized_db.job_status("collect", "10") == "pending"
+
+
+@pytest.mark.parametrize(
+    "initial_status",
+    [None, "pending", "failed", "complete", "permanent_failure"],
+)
+def test_requeue_and_claim_specific_job_forces_only_requested_non_running_job(
+    initialized_db, initial_status
+):
+    initialized_db.enqueue_job("collect", "99")
+    if initial_status is not None:
+        initialized_db.enqueue_job("collect", "10")
+        initialized_db.connection.execute(
+            """
+            UPDATE sync_jobs
+            SET status = ?, attempt_count = 2, next_attempt_at = '2999-01-01T00:00:00Z',
+                last_error = 'old failure'
+            WHERE item_key = '10'
+            """,
+            (initial_status,),
+        )
+
+    claimed = initialized_db.requeue_and_claim_specific_job(
+        "collect", "10", lease_token="opaque-target-lease"
+    )
+
+    assert claimed is not None
+    assert (
+        claimed["status"],
+        claimed["attempt_count"],
+        claimed["lease_token"],
+        claimed["next_attempt_at"],
+        claimed["last_error"],
+    ) == ("running", 1, "opaque-target-lease", None, None)
+    assert initialized_db.job_status("collect", "99") == "pending"
+
+
+def test_requeue_and_claim_specific_job_preserves_valid_running_lease(initialized_db):
+    initialized_db.enqueue_job("collect", "10")
+    running = initialized_db.claim_job("collect", lease_token="current-owner")
+
+    claimed = initialized_db.requeue_and_claim_specific_job(
+        "collect", "10", lease_token="would-be-thief"
+    )
+
+    assert claimed is None
+    row = initialized_db.connection.execute(
+        "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"
+    ).fetchone()
+    assert tuple(row) == ("running", running["attempt_count"], "current-owner")
 
 
 def test_failed_jobs_retry_when_due_then_become_permanent(initialized_db):
@@ -277,7 +326,7 @@ def test_bootstrap_resumes_at_next_page_and_restart_requeues_work(pipeline_facto
     assert db.job_status("collect", "10") == "pending"
 
 
-def test_bootstrap_provisional_skip_preserves_existing_metadata(pipeline_factory):
+def test_bootstrap_provisional_undercount_preserves_authoritative_game(pipeline_factory):
     pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 19)]])
     db.upsert_game(
         appid=10,
@@ -287,14 +336,20 @@ def test_bootstrap_provisional_skip_preserves_existing_metadata(pipeline_factory
         detailed_description_text="Keep this searchable description.",
         steam_total_reviews=42,
         review_score=8,
+        metadata_fetched_at="2026-07-20T00:00:00+00:00",
+        reviews_fetched_at="2026-07-20T00:00:00+00:00",
     )
+    _store_sample(db)
+    db.enqueue_job("collect", "10")
+    lease = db.claim_job("collect")
+    db.complete_job("collect", "10", expected_lease_token=lease["lease_token"])
 
     pipeline.bootstrap("steamspy", page_limit=1)
 
     row = db.connection.execute(
         """
         SELECT name, detailed_description_text, steam_total_reviews, review_score,
-               eligibility_status
+               eligibility_status, metadata_fetched_at, reviews_fetched_at
         FROM games WHERE appid = 10
         """
     ).fetchone()
@@ -303,8 +358,12 @@ def test_bootstrap_provisional_skip_preserves_existing_metadata(pipeline_factory
         "Keep this searchable description.",
         42,
         8,
-        "below_provisional_threshold",
+        "eligible",
+        "2026-07-20T00:00:00+00:00",
+        "2026-07-20T00:00:00+00:00",
     )
+    assert db.job_status("collect", "10") == "complete"
+    assert db.review_count(10) == 1
     assert (
         db.connection.execute(
             "SELECT COUNT(*) FROM game_search WHERE game_search MATCH 'searchable'"
@@ -451,7 +510,14 @@ def _store_old_sample(db: Database) -> None:
         name="Previously eligible",
         eligibility_status="eligible",
         updated_at="2026-07-20T00:00:00Z",
+        steam_total_reviews=30,
+        metadata_fetched_at="2026-07-20T00:00:00Z",
+        reviews_fetched_at="2026-07-20T00:00:00Z",
     )
+    _store_sample(db)
+
+
+def _store_sample(db: Database) -> None:
     db.replace_review_samples(
         10,
         {
@@ -490,15 +556,94 @@ def test_eligible_refresh_to_ineligible_clears_review_samples(
     assert db.search_reviews("retained", 10) == []
 
 
-def test_provisional_refresh_to_below_threshold_clears_review_samples(pipeline_factory):
+def test_provisional_refresh_preserves_authoritative_review_samples(pipeline_factory):
     pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 19)]])
     _store_old_sample(db)
 
     pipeline.bootstrap("steamspy", resume=False, page_limit=1)
 
-    assert db.game_status(10) == "below_provisional_threshold"
-    assert db.review_count(10) == 0
-    assert db.search_reviews("retained", 10) == []
+    assert db.game_status(10) == "eligible"
+    assert db.review_count(10) == 1
+    assert [row["recommendation_id"] for row in db.search_reviews("retained", 10)] == ["old"]
+
+
+def test_provisional_undercount_preserves_below_verified_authority(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 5)]])
+    db.record_game_status(
+        10,
+        "below_verified_threshold",
+        skip_reason="below_verified_threshold",
+        steam_total_positive=12,
+        steam_total_negative=7,
+        steam_total_reviews=19,
+        review_score=5,
+        review_score_desc="Mixed",
+        reviews_fetched_at="2026-06-01T00:00:00Z",
+        replace_steam_aggregate=True,
+        updated_at="2026-06-01T00:00:00Z",
+    )
+
+    pipeline.bootstrap("steamspy", resume=False, page_limit=1)
+
+    row = db.connection.execute(
+        """
+        SELECT eligibility_status, skip_reason, steam_total_positive, steam_total_negative,
+               steam_total_reviews, review_score, review_score_desc, reviews_fetched_at
+        FROM games WHERE appid = 10
+        """
+    ).fetchone()
+    assert tuple(row) == (
+        "below_verified_threshold",
+        "below_verified_threshold",
+        12,
+        7,
+        19,
+        5,
+        "Mixed",
+        "2026-06-01T00:00:00Z",
+    )
+    assert db.job_status("collect", "10") == "pending"
+
+
+def test_legacy_canonical_aggregate_is_protected_but_stale(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 5)]])
+    db.upsert_game(
+        appid=10,
+        name="Legacy verified",
+        eligibility_status="eligible",
+        steam_total_reviews=25,
+        updated_at="2026-07-20T00:00:00Z",
+    )
+
+    pipeline.bootstrap("steamspy", page_limit=1)
+    scheduled = db.schedule_refresh("2026-01-01T00:00:00Z")
+
+    assert db.game_status(10) == "eligible"
+    assert scheduled == 1
+    assert db.job_status("collect", "10") == "pending"
+
+
+def test_rediscovery_does_not_make_stale_authoritative_collection_fresh(pipeline_factory):
+    pipeline, db = pipeline_factory(steamspy_pages=[[item(10, 30)]])
+    db.upsert_game(
+        appid=10,
+        name="Stale collected game",
+        eligibility_status="eligible",
+        steam_total_reviews=30,
+        metadata_fetched_at="2000-01-01T00:00:00Z",
+        reviews_fetched_at="2000-01-01T00:00:00Z",
+        updated_at="2000-01-01T00:00:00Z",
+    )
+
+    pipeline.bootstrap("steamspy", page_limit=1)
+    scheduled = db.schedule_refresh("2026-01-01T00:00:00Z")
+
+    assert scheduled == 1
+    assert db.job_status("collect", "10") == "pending"
+    assert (
+        db.connection.execute("SELECT updated_at FROM games WHERE appid = 10").fetchone()[0]
+        == "2000-01-01T00:00:00Z"
+    )
 
 
 def test_stale_lease_rollback_preserves_previous_review_samples(pipeline_factory):

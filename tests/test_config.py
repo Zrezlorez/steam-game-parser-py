@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from steam_catalog.config import Settings
+from steam_catalog import pipeline
 
 
 def test_settings_use_project_database_by_default(monkeypatch):
@@ -12,7 +13,7 @@ def test_settings_use_project_database_by_default(monkeypatch):
     settings = Settings.from_env()
 
     assert settings.database.name == "steam_catalog.sqlite3"
-    assert settings.min_reviews == 20
+    assert pipeline.MIN_REVIEWS == 20
     assert settings.steamspy_all_interval_seconds == 60.0
 
 
@@ -47,7 +48,7 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
     settings = Settings.from_env()
 
     assert settings.database == database.resolve()
-    assert settings.min_reviews == 42
+    assert not hasattr(settings, "min_reviews")
     assert settings.request_timeout_seconds == 15.5
     assert settings.steam_interval_seconds == 1.25
     assert settings.steamspy_interval_seconds == 2.5
@@ -79,4 +80,18 @@ def test_settings_are_immutable():
     settings = Settings.from_env()
 
     with pytest.raises(FrozenInstanceError):
-        settings.min_reviews = 10
+        settings.max_attempts = 10
+
+
+def test_catalog_pipeline_does_not_accept_a_variable_review_threshold(initialized_db, monkeypatch):
+    from steam_catalog.pipeline import CatalogPipeline
+
+    monkeypatch.setenv("STEAM_CATALOG_MIN_REVIEWS", "42")
+
+    with pytest.raises(TypeError, match="min_reviews"):
+        CatalogPipeline(
+            initialized_db,
+            steam=object(),
+            steamspy=object(),
+            min_reviews=42,
+        )

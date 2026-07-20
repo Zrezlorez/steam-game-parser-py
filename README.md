@@ -16,7 +16,7 @@ python -m pip install -e ".[dev]"
 steam-catalog init
 steam-catalog import-library ..\data\steam_info.json
 steam-catalog bootstrap --source steamspy --resume
-steam-catalog collect --limit 10 --resume
+steam-catalog collect --limit 10
 steam-catalog status
 ```
 
@@ -43,8 +43,8 @@ steam-catalog bootstrap --source steamspy --resume
 steam-catalog bootstrap --source steam --resume
 
 # Try a bounded collection run, then consume the complete durable queue.
-steam-catalog collect --limit 10 --resume
-steam-catalog collect --resume
+steam-catalog collect --limit 10
+steam-catalog collect
 
 # Fetch exactly one app without changing unrelated queued work.
 steam-catalog collect --appid 4000
@@ -56,13 +56,14 @@ steam-catalog status
 The initial bootstrap and full collection can take many hours. Cached requests and durable jobs
 make later runs incremental. Pressing Ctrl+C leaves work resumable and exits with status 130.
 
-To schedule records whose catalog timestamp is older than a UTC cutoff, use `refresh`. Permanent
-failures remain untouched unless `--failed` is explicit:
+To schedule records whose authoritative Steam verification is older than a UTC cutoff, use
+`refresh`. Rows that have never been verified are conservatively stale. Permanent failures remain
+untouched unless `--failed` is explicit:
 
 ```powershell
 steam-catalog refresh --older-than-days 30
 steam-catalog refresh --older-than-days 30 --failed
-steam-catalog collect --resume
+steam-catalog collect
 ```
 
 ## Library Import
