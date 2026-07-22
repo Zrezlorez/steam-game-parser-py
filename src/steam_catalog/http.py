@@ -22,7 +22,7 @@ Sleep = Callable[[float], None]
 
 
 class CachedHttpClient:
-    """Fetch JSON responses with SQLite caching, retries, and rate buckets."""
+    """Fetch JSON responses with retries and rate buckets."""
 
     def __init__(
         self,
@@ -57,48 +57,13 @@ class CachedHttpClient:
         rate_bucket: str | None = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        """Return a cached or fetched JSON object for a GET request."""
-        normalized_url, cache_key = self._normalized_url_and_key(url, params)
-        ttl = cache_ttl if cache_ttl is not None else timedelta(hours=self.settings.cache_ttl_hours)
-        cached = self.database.get_http_cache(cache_key)
-        now = self._now()
-        if (
-            not force_refresh
-            and cached is not None
-            and self._parse_datetime(cached["expires_at"]) > now
-        ):
-            return self._decode_json(cached["response_body"])
-
-        headers = self._conditional_headers(cached) if not force_refresh else {}
-        response = self._request_with_retries(normalized_url, headers, rate_bucket)
-
-        if response.status_code == httpx.codes.NOT_MODIFIED and cached is not None:
-            body = cached["response_body"]
-            result = self._decode_json(body)
-            self._store_response(
-                cache_key=cache_key,
-                url=normalized_url,
-                status_code=cached["status_code"],
-                body=body,
-                etag=response.headers.get("ETag", cached["etag"]),
-                last_modified=response.headers.get("Last-Modified", cached["last_modified"]),
-                ttl=ttl,
-            )
-            return result
+        """Fetch and decode one JSON object without persisting the raw response."""
+        normalized_url, _cache_key = self._normalized_url_and_key(url, params)
+        response = self._request_with_retries(normalized_url, {}, rate_bucket)
 
         response.raise_for_status()
         body = response.content.decode("utf-8")
-        result = self._decode_json(body)
-        self._store_response(
-            cache_key=cache_key,
-            url=normalized_url,
-            status_code=response.status_code,
-            body=body,
-            etag=response.headers.get("ETag"),
-            last_modified=response.headers.get("Last-Modified"),
-            ttl=ttl,
-        )
-        return result
+        return self._decode_json(body)
 
     def _request_with_retries(
         self, url: str, headers: dict[str, str], rate_bucket: str | None
@@ -161,19 +126,6 @@ class CachedHttpClient:
         return normalized_url, cache_key
 
     @staticmethod
-    def _conditional_headers(cached: Any) -> dict[str, str]:
-        if cached is None:
-            return {}
-        return {
-            key: value
-            for key, value in {
-                "If-None-Match": cached["etag"],
-                "If-Modified-Since": cached["last_modified"],
-            }.items()
-            if value is not None
-        }
-
-    @staticmethod
     def _is_retryable(status_code: int) -> bool:
         return status_code == httpx.codes.TOO_MANY_REQUESTS or 500 <= status_code < 600
 
@@ -201,37 +153,9 @@ class CachedHttpClient:
     def _backoff(attempt: int) -> float:
         return min(60, 2 ** (attempt - 1)) + random.uniform(0, 0.25)
 
-    def _store_response(
-        self,
-        *,
-        cache_key: str,
-        url: str,
-        status_code: int,
-        body: str,
-        etag: str | None,
-        last_modified: str | None,
-        ttl: timedelta,
-    ) -> None:
-        fetched_at = self._now()
-        self.database.upsert_http_cache(
-            cache_key=cache_key,
-            url=url,
-            status_code=status_code,
-            response_body=body,
-            etag=etag,
-            last_modified=last_modified,
-            fetched_at=fetched_at.isoformat(),
-            expires_at=(fetched_at + ttl).isoformat(),
-        )
-
     def _now(self) -> datetime:
         now = self.clock()
         return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
-
-    @staticmethod
-    def _parse_datetime(value: str) -> datetime:
-        parsed = datetime.fromisoformat(value)
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     @staticmethod
     def _decode_json(body: str) -> dict[str, Any]:

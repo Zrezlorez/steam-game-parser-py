@@ -1,10 +1,10 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
 
-def test_second_identical_request_uses_sqlite_cache(http_client_factory):
+def test_repeated_requests_are_not_persisted(http_client_factory, initialized_db):
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -16,66 +16,25 @@ def test_second_identical_request_uses_sqlite_cache(http_client_factory):
 
     assert client.get_json("https://example.test/data") == {"ok": True}
     assert client.get_json("https://example.test/data") == {"ok": True}
-    assert calls == 1
+    assert calls == 2
+    assert initialized_db.connection.execute("SELECT count(*) FROM http_cache").fetchone()[0] == 0
 
 
 def test_cache_key_normalizes_host_and_sorted_query_parameters(http_client_factory):
-    calls = 0
+    urls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        urls.append(str(request.url))
         return httpx.Response(200, json={"ok": True})
 
     client = http_client_factory(handler)
 
     assert client.get_json("https://EXAMPLE.test/data?b=two", params={"a": "one"}) == {"ok": True}
     assert client.get_json("https://example.test/data?a=one&b=two") == {"ok": True}
-    assert calls == 1
-
-
-def test_expired_entry_uses_conditional_headers_before_revalidation(http_client_factory):
-    now = datetime(2026, 7, 20, tzinfo=UTC)
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(
-                200,
-                json={"ok": True},
-                headers={"ETag": '"version-1"', "Last-Modified": "Sun, 20 Jul 2025 00:00:00 GMT"},
-            )
-        return httpx.Response(304)
-
-    client = http_client_factory(handler, clock=lambda: now)
-
-    assert client.get_json("https://example.test/data", cache_ttl=timedelta(seconds=1)) == {
-        "ok": True
-    }
-    now += timedelta(seconds=2)
-    assert client.get_json("https://example.test/data", cache_ttl=timedelta(seconds=1)) == {
-        "ok": True
-    }
-    assert requests[1].headers["if-none-match"] == '"version-1"'
-    assert requests[1].headers["if-modified-since"] == "Sun, 20 Jul 2025 00:00:00 GMT"
-
-
-def test_zero_cache_ttl_revalidates_on_second_request(http_client_factory):
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(200, json={"ok": True}, headers={"ETag": '"version-1"'})
-        return httpx.Response(304)
-
-    client = http_client_factory(handler)
-
-    assert client.get_json("https://example.test/data", cache_ttl=timedelta(0)) == {"ok": True}
-    assert client.get_json("https://example.test/data", cache_ttl=timedelta(0)) == {"ok": True}
-    assert len(requests) == 2
-    assert requests[1].headers["if-none-match"] == '"version-1"'
+    assert urls == [
+        "https://example.test/data?a=one&b=two",
+        "https://example.test/data?a=one&b=two",
+    ]
 
 
 def test_429_uses_retry_after_before_retrying(http_client_factory):

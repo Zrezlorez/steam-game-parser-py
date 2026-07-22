@@ -146,6 +146,10 @@ def _print_price_summary(
     )
 
 
+def _format_file_size(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MiB"
+
+
 def _print_bootstrap_event(event: BootstrapProgressEvent) -> None:
     page = "Steam app list" if event.source_page is None else f"Discovery page {event.source_page}"
     if event.stage == "fetching":
@@ -226,6 +230,21 @@ def init_command(context: typer.Context) -> None:
     settings: Settings = context.obj
     with _database(settings) as database:
         typer.echo(f"Initialized: {database.path}")
+
+
+@app.command("compact")
+@_command_errors
+def compact_command(context: typer.Context) -> None:
+    """Delete legacy raw HTTP responses and compact the SQLite database."""
+    settings: Settings = context.obj
+    before_size = settings.database.stat().st_size if settings.database.exists() else 0
+    with _database(settings) as database:
+        removed = database.compact_http_cache()
+    after_size = settings.database.stat().st_size
+    typer.echo(f"Database: {settings.database}")
+    typer.echo(f"Removed HTTP cache rows: {removed}")
+    typer.echo(f"Before: {_format_file_size(before_size)}")
+    typer.echo(f"After: {_format_file_size(after_size)}")
 
 
 @app.command("bootstrap")

@@ -262,6 +262,7 @@ steam-catalog collect-prices --appid 4000
 | `bootstrap` | Найти кандидатов и наполнить очередь |
 | `collect` | Обработать одну игру или очередь |
 | `collect-prices` | Отдельно догрузить цены USD и UAH для подходящих игр |
+| `compact` | Удалить старый HTTP-кэш и уменьшить файл SQLite |
 | `refresh` | Повторно поставить устаревшие записи в очередь |
 | `status` | Показать состояния каталога и очереди |
 | `export` | Экспортировать подходящие игры в JSONL или CSV |
@@ -272,8 +273,19 @@ steam-catalog collect-prices --appid 4000
 steam-catalog run --help
 steam-catalog collect --help
 steam-catalog collect-prices --help
+steam-catalog compact --help
 steam-catalog export --help
 ```
+
+### Уменьшение базы данных
+
+Сырые HTTP-ответы больше не сохраняются. Чтобы удалить накопленный кэш из существующей базы и вернуть свободные страницы файловой системе:
+
+```powershell
+steam-catalog compact
+```
+
+Не запускайте `compact` одновременно с `run`, `bootstrap`, `collect` или `collect-prices`. Команда удаляет только восстанавливаемый HTTP-кэш; игры, отзывы, поисковые индексы и очередь сохраняются.
 
 ### Выбор источника discovery
 

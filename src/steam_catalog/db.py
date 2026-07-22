@@ -683,6 +683,16 @@ class Database:
                 ),
             )
 
+    def compact_http_cache(self) -> int:
+        """Remove legacy raw HTTP responses and reclaim their SQLite pages."""
+        with self.transaction():
+            cursor = self.connection.execute("DELETE FROM http_cache")
+        checkpoint = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and checkpoint[0] != 0:
+            raise RuntimeError("Database is busy; stop other catalog processes and retry")
+        self.connection.execute("VACUUM")
+        return cursor.rowcount
+
     def upsert_source_item(
         self,
         source: str,
