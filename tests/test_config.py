@@ -9,12 +9,14 @@ from steam_catalog import pipeline
 
 def test_settings_use_project_database_by_default(monkeypatch):
     monkeypatch.delenv("STEAM_CATALOG_DATABASE", raising=False)
+    monkeypatch.delenv("STEAM_CATALOG_STEAM_WEB_API_KEY", raising=False)
 
     settings = Settings.from_env()
 
     assert settings.database.name == "steam_catalog.sqlite3"
     assert pipeline.MIN_REVIEWS == 20
     assert settings.steamspy_all_interval_seconds == 60.0
+    assert settings.steam_web_api_key is None
 
 
 def test_default_database_is_independent_of_current_working_directory(monkeypatch, tmp_path):
@@ -44,6 +46,7 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("STEAM_CATALOG_STEAMSPY_ALL_INTERVAL_SECONDS", "75")
     monkeypatch.setenv("STEAM_CATALOG_MAX_ATTEMPTS", "4")
     monkeypatch.setenv("STEAM_CATALOG_CACHE_TTL_HOURS", "72")
+    monkeypatch.setenv("STEAM_CATALOG_STEAM_WEB_API_KEY", "  test-key  ")
 
     settings = Settings.from_env()
 
@@ -55,6 +58,13 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
     assert settings.steamspy_all_interval_seconds == 75.0
     assert settings.max_attempts == 4
     assert settings.cache_ttl_hours == 72
+    assert settings.steam_web_api_key == "test-key"
+
+
+def test_blank_steam_web_api_key_is_disabled(monkeypatch):
+    monkeypatch.setenv("STEAM_CATALOG_STEAM_WEB_API_KEY", "   ")
+
+    assert Settings.from_env().steam_web_api_key is None
 
 
 @pytest.mark.parametrize(

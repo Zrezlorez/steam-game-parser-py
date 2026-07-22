@@ -295,11 +295,15 @@ SteamSpy используется по умолчанию и позволяет 
 steam-catalog bootstrap --source steamspy --resume
 ```
 
-Список приложений Steam доступен как запасной источник, но не содержит предварительных счётчиков:
+Официальный список Steam используется как дополнительный источник для игр, которых нет в SteamSpy. Для него нужен [Steam Web API key](https://steamcommunity.com/dev/apikey):
 
 ```powershell
+$env:STEAM_CATALOG_STEAM_WEB_API_KEY = "ваш-ключ"
 steam-catalog bootstrap --source steam --resume
+steam-catalog collect
 ```
+
+Официальный список не содержит предварительных счётчиков отзывов, поэтому новые appid проверяются напрямую через Steam на этапе `collect`.
 
 `--no-resume` принудительно начинает discovery источника с начала. Обычно нужен `--resume`.
 
@@ -332,6 +336,13 @@ steam-catalog collect
 
 ```powershell
 steam-catalog refresh --reason unavailable
+steam-catalog collect
+```
+
+Повторно проверить через Steam все игры, ранее не прошедшие минимальный порог отзывов:
+
+```powershell
+steam-catalog refresh --reason below_verified_threshold
 steam-catalog collect
 ```
 
@@ -450,6 +461,7 @@ steam-catalog export .\data\catalog.csv --format csv
 | Переменная | Значение по умолчанию | Назначение |
 | --- | ---: | --- |
 | `STEAM_CATALOG_DATABASE` | `data\steam_catalog.sqlite3` | Путь к SQLite, если не указан `--database` |
+| `STEAM_CATALOG_STEAM_WEB_API_KEY` | — | Ключ для `bootstrap --source steam`; для SteamSpy не требуется |
 | `STEAM_CATALOG_REQUEST_TIMEOUT_SECONDS` | `30` | Таймаут HTTP-запроса |
 | `STEAM_CATALOG_STEAM_INTERVAL_SECONDS` | `1` | Минимальный интервал запросов Steam |
 | `STEAM_CATALOG_STEAMSPY_INTERVAL_SECONDS` | `1` | Интервал обычных запросов SteamSpy |

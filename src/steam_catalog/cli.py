@@ -216,7 +216,7 @@ def _pipeline(database: Database, settings: Settings) -> Iterator[CatalogPipelin
     try:
         yield CatalogPipeline(
             database,
-            steam=SteamClient(http),
+            steam=SteamClient(http, api_key=settings.steam_web_api_key),
             steamspy=SteamSpyClient(http),
         )
     finally:

@@ -2,12 +2,14 @@ from copy import deepcopy
 from datetime import timedelta
 import json
 
+import httpx
 import pytest
 
 from steam_catalog.sources.steam import (
     SteamClient,
     normalize_html,
     parse_app_details,
+    parse_app_list_page,
     parse_review_page,
 )
 
@@ -72,6 +74,83 @@ def test_parse_app_details_keeps_html_and_search_text(load_fixture):
     assert details.header_image_url == "https://cdn.example.test/header.jpg"
     assert details.screenshots_json == '[{"id":1,"path_full":"https://cdn.example.test/one.jpg"}]'
     assert details.prices_json is None
+
+
+def test_parse_app_list_page_reads_official_response_and_compacts_payloads():
+    items, have_more, last_appid = parse_app_list_page(
+        {
+            "response": {
+                "apps": [
+                    {"appid": 10, "name": "Drill Builder", "last_modified": 123},
+                    {"appid": 0, "name": "Invalid"},
+                    {"appid": True, "name": "Invalid boolean"},
+                ],
+                "have_more_results": True,
+                "last_appid": 10,
+            }
+        }
+    )
+
+    assert [item.appid for item in items] == [10]
+    assert items[0].name == "Drill Builder"
+    assert items[0].payload_json == '{"appid":10,"last_modified":123,"name":"Drill Builder"}'
+    assert have_more is True
+    assert last_appid == 10
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"response": []},
+        {"response": {"apps": {}, "have_more_results": False}},
+        {"response": {"apps": [], "have_more_results": 1}},
+        {"response": {"apps": [], "have_more_results": True, "last_appid": 0}},
+    ],
+)
+def test_parse_app_list_page_rejects_malformed_responses(payload):
+    with pytest.raises(ValueError, match="Steam app list"):
+        parse_app_list_page(payload)
+
+
+def test_fetch_app_pages_requires_key_before_http_request():
+    class UnexpectedHttpClient:
+        def get_json(self, *args, **kwargs):
+            raise AssertionError("HTTP must not be called")
+
+    with pytest.raises(ValueError, match="STEAM_CATALOG_STEAM_WEB_API_KEY"):
+        list(SteamClient(UnexpectedHttpClient()).fetch_app_pages())
+
+
+def test_fetch_app_pages_rejects_non_advancing_cursor():
+    class StaticCursorHttpClient:
+        def get_json(self, *args, **kwargs):
+            return {
+                "response": {
+                    "apps": [{"appid": 10, "name": "Game"}],
+                    "have_more_results": True,
+                    "last_appid": 10,
+                }
+            }
+
+    with pytest.raises(ValueError, match="cursor"):
+        list(SteamClient(StaticCursorHttpClient(), api_key="test-key").fetch_app_pages())
+
+
+def test_fetch_app_pages_redacts_key_from_http_errors():
+    class FailingHttpClient:
+        def get_json(self, *args, **kwargs):
+            request = httpx.Request(
+                "GET",
+                "https://api.steampowered.com/IStoreService/GetAppList/v1/?key=secret-key",
+            )
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    with pytest.raises(RuntimeError, match="HTTP 403") as caught:
+        list(SteamClient(FailingHttpClient(), api_key="secret-key").fetch_app_pages())
+
+    assert "secret-key" not in str(caught.value)
 
 
 def test_parse_app_details_returns_none_for_missing_app_and_rejects_malformed_response():
@@ -252,12 +331,28 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
                 return payload
             if "reviews" in url:
                 return load_fixture("steam_reviews.json")
-            return {"applist": {"apps": [{"appid": "10", "name": "Drill Builder"}, {"appid": 0}]}}
+            if "last_appid" not in params:
+                return {
+                    "response": {
+                        "apps": [{"appid": 10, "name": "Drill Builder"}, {"appid": 0}],
+                        "have_more_results": True,
+                        "last_appid": 10,
+                    }
+                }
+            return {
+                "response": {
+                    "apps": [{"appid": 20, "name": "Second Page"}],
+                    "have_more_results": False,
+                }
+            }
 
     http = RecordingHttpClient()
-    client = SteamClient(http)
+    client = SteamClient(http, api_key="test-key")
 
-    assert [item.appid for item in client.fetch_app_list()] == [10]
+    assert [
+        ([item.appid for item in page], is_last)
+        for page, is_last in client.fetch_app_pages()
+    ] == [([10], False), ([20], True)]
     assert client.fetch_app_details(10) is not None
     assert json.loads(client.fetch_regional_prices(10)) == {
         "USD": {"currency": "USD", "initial": 999, "final": 499},
@@ -266,8 +361,19 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
     assert client.fetch_reviews(10, "recent", "positive", 5).total_reviews == 20
     assert http.calls == [
         (
-            "https://api.steampowered.com/ISteamApps/GetAppList/v2/",
-            {},
+            "https://api.steampowered.com/IStoreService/GetAppList/v1/",
+            {"key": "test-key", "include_games": "true", "max_results": "50000"},
+            timedelta(days=7),
+            "steam",
+        ),
+        (
+            "https://api.steampowered.com/IStoreService/GetAppList/v1/",
+            {
+                "key": "test-key",
+                "include_games": "true",
+                "max_results": "50000",
+                "last_appid": "10",
+            },
             timedelta(days=7),
             "steam",
         ),

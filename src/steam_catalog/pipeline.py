@@ -1,6 +1,6 @@
 """Resumable discovery and verified eligibility collection."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from time import monotonic
@@ -43,7 +43,7 @@ def select_reviews(
 
 
 class SteamProvider(Protocol):
-    def fetch_app_list(self) -> list[DiscoveryItem]: ...
+    def fetch_app_pages(self) -> Iterator[tuple[list[DiscoveryItem], bool]]: ...
 
     def fetch_app_details(self, appid: int) -> GameDetails | None: ...
 
@@ -358,11 +358,20 @@ class CatalogPipeline:
         on_progress: Callable[[BootstrapProgressEvent], None] | None,
     ):
         if source == "steam":
-            if page_limit != 0:
+            pages = iter(self.steam.fetch_app_pages())
+            page = 0
+            while page_limit is None or page < page_limit:
                 if on_progress is not None:
-                    on_progress(BootstrapProgressEvent(stage="fetching", source_page=None))
+                    on_progress(BootstrapProgressEvent(stage="fetching", source_page=page))
                 started = monotonic()
-                yield None, self.steam.fetch_app_list(), started
+                try:
+                    items, is_last = next(pages)
+                except StopIteration:
+                    return
+                yield page, items, started
+                if is_last:
+                    return
+                page += 1
             return
         if source != "steamspy":
             raise ValueError(f"Unsupported discovery source: {source}")

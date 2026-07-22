@@ -19,6 +19,7 @@ class Settings:
     steamspy_all_interval_seconds: float
     max_attempts: int
     cache_ttl_hours: int
+    steam_web_api_key: str | None
 
     @classmethod
     def from_env(cls, database: Path | None = None) -> "Settings":
@@ -36,6 +37,10 @@ class Settings:
         steamspy_interval_seconds = _float_env("STEAMSPY_INTERVAL_SECONDS", 1.0)
         steamspy_all_interval_seconds = _float_env("STEAMSPY_ALL_INTERVAL_SECONDS", 60.0)
         max_attempts = _int_env("MAX_ATTEMPTS", 3)
+        raw_steam_web_api_key = os.environ.get("STEAM_CATALOG_STEAM_WEB_API_KEY")
+        steam_web_api_key = (
+            raw_steam_web_api_key.strip() if raw_steam_web_api_key is not None else None
+        ) or None
 
         for name, value in {
             "request_timeout_seconds": request_timeout_seconds,
@@ -55,6 +60,7 @@ class Settings:
             steamspy_all_interval_seconds=steamspy_all_interval_seconds,
             max_attempts=max_attempts,
             cache_ttl_hours=_int_env("CACHE_TTL_HOURS", 24),
+            steam_web_api_key=steam_web_api_key,
         )
 
 

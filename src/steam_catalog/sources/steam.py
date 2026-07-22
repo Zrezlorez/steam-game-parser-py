@@ -7,12 +7,15 @@ from html.parser import HTMLParser
 import re
 from typing import Any
 
+import httpx
+
 from steam_catalog.http import CachedHttpClient
 from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
 from steam_catalog.sources.steamspy import _compact_json, _positive_appid
 
 
-APP_LIST_URL = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+APP_LIST_URL = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
+APP_LIST_MAX_RESULTS = 50_000
 APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
 REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 METADATA_CACHE_TTL = timedelta(days=7)
@@ -54,15 +57,45 @@ _BLOCK_TAGS = frozenset(
 class SteamClient:
     """Fetch Steam app metadata and user reviews through cached HTTP."""
 
-    def __init__(self, http: CachedHttpClient) -> None:
+    def __init__(self, http: CachedHttpClient, *, api_key: str | None = None) -> None:
         self.http = http
+        self.api_key = api_key
 
-    def fetch_app_list(self) -> Iterator[DiscoveryItem]:
-        """Yield valid entries from the Steam app-list endpoint."""
-        payload = self.http.get_json(
-            APP_LIST_URL, params={}, cache_ttl=METADATA_CACHE_TTL, rate_bucket="steam"
-        )
-        yield from parse_app_list(payload)
+    def fetch_app_pages(self) -> Iterator[tuple[list[DiscoveryItem], bool]]:
+        """Yield official Steam game-list pages using a validated advancing cursor."""
+        if self.api_key is None:
+            raise ValueError(
+                "STEAM_CATALOG_STEAM_WEB_API_KEY is required for --source steam"
+            )
+        cursor: int | None = None
+        while True:
+            params = {
+                "key": self.api_key,
+                "include_games": "true",
+                "max_results": str(APP_LIST_MAX_RESULTS),
+            }
+            if cursor is not None:
+                params["last_appid"] = str(cursor)
+            try:
+                payload = self.http.get_json(
+                    APP_LIST_URL,
+                    params=params,
+                    cache_ttl=METADATA_CACHE_TTL,
+                    rate_bucket="steam",
+                )
+            except httpx.HTTPStatusError as error:
+                raise RuntimeError(
+                    f"Steam app list request failed with HTTP {error.response.status_code}"
+                ) from error
+            except httpx.HTTPError as error:
+                raise RuntimeError("Steam app list request failed") from error
+            items, have_more, next_cursor = parse_app_list_page(payload)
+            yield items, not have_more
+            if not have_more:
+                return
+            if next_cursor is None or (cursor is not None and next_cursor <= cursor):
+                raise ValueError("Steam app list cursor did not advance")
+            cursor = next_cursor
 
     def fetch_app_details(self, appid: int) -> GameDetails | None:
         """Fetch KZ metadata and its storefront price."""
@@ -160,13 +193,24 @@ def normalize_html(value: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def parse_app_list(payload: Mapping[str, Any]) -> list[DiscoveryItem]:
-    """Parse valid Steam app-list entries into discovery items."""
-    app_list = payload.get("applist")
-    if not isinstance(app_list, Mapping) or not isinstance(app_list.get("apps"), list):
+def parse_app_list_page(
+    payload: Mapping[str, Any],
+) -> tuple[list[DiscoveryItem], bool, int | None]:
+    """Parse one official Steam app-list page and its continuation cursor."""
+    response = payload.get("response")
+    if not isinstance(response, Mapping) or not isinstance(response.get("apps"), list):
+        raise ValueError("Steam app list response is malformed")
+    have_more = response.get("have_more_results")
+    if not isinstance(have_more, bool):
+        raise ValueError("Steam app list response is malformed")
+    raw_last_appid = response.get("last_appid")
+    last_appid = _positive_appid(raw_last_appid) if raw_last_appid is not None else None
+    if raw_last_appid is not None and last_appid is None:
+        raise ValueError("Steam app list response is malformed")
+    if have_more and last_appid is None:
         raise ValueError("Steam app list response is malformed")
     items: list[DiscoveryItem] = []
-    for source_item in app_list["apps"]:
+    for source_item in response["apps"]:
         if not isinstance(source_item, Mapping):
             continue
         appid = _positive_appid(source_item.get("appid"))
@@ -178,7 +222,7 @@ def parse_app_list(payload: Mapping[str, Any]) -> list[DiscoveryItem]:
                     payload_json=_compact_json(source_item),
                 )
             )
-    return items
+    return items, have_more, last_appid
 
 
 def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | None:

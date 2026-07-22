@@ -369,6 +369,26 @@ def test_bootstrap_delegates_without_printing_payloads(tmp_path: Path, monkeypat
     assert "payload" not in result.stdout.lower()
 
 
+def test_steam_bootstrap_without_api_key_fails_before_http(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("STEAM_CATALOG_STEAM_WEB_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "--database",
+            str(tmp_path / "catalog.sqlite3"),
+            "bootstrap",
+            "--source",
+            "steam",
+            "--page-limit",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "steam_catalog_steam_web_api_key is required" in result.stdout.lower()
+
+
 def test_run_orchestrates_all_phases_and_forwards_options(tmp_path: Path, monkeypatch):
     library = tmp_path / "library.json"
     library.write_text('[{"appid":10,"name":"Owned"}]', encoding="utf-8")

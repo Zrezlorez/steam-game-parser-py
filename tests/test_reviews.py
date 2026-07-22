@@ -55,8 +55,8 @@ class RecordingSteamClient:
         self.targeted_calls: list[tuple[int, str, str, int]] = []
         self.calls: list[tuple[int, str, str, int]] = []
 
-    def fetch_app_list(self):
-        return []
+    def fetch_app_pages(self):
+        return iter(())
 
     def fetch_app_details(self, appid: int) -> GameDetails:
         return GameDetails(

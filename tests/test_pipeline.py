@@ -41,6 +41,7 @@ class FakeSteamClient:
         coming_soon: bool,
         app_available: bool,
         app_list: list[DiscoveryItem] | None = None,
+        app_pages: list[list[DiscoveryItem]] | None = None,
     ) -> None:
         self.review_page = ReviewPage(
             total_reviews=review_total,
@@ -52,13 +53,14 @@ class FakeSteamClient:
             is_released=not coming_soon,
             coming_soon=coming_soon,
         )
-        self.app_list = app_list or []
+        self.app_pages = app_pages if app_pages is not None else [app_list or []]
         self.app_available = app_available
         self.calls: list[tuple[object, ...]] = []
 
-    def fetch_app_list(self) -> list[DiscoveryItem]:
-        self.calls.append(("app_list",))
-        return self.app_list
+    def fetch_app_pages(self):
+        for page, items in enumerate(self.app_pages):
+            self.calls.append(("app_page", page))
+            yield items, page == len(self.app_pages) - 1
 
     def fetch_reviews(self, appid: int, filter: str, review_type: str, limit: int) -> ReviewPage:
         self.calls.append(("reviews", appid, filter, review_type, limit))
@@ -92,6 +94,7 @@ def pipeline_factory(tmp_path):
         coming_soon: bool = False,
         app_available: bool = True,
         app_list: list[DiscoveryItem] | None = None,
+        app_pages: list[list[DiscoveryItem]] | None = None,
     ) -> tuple[CatalogPipeline, Database]:
         database = Database(tmp_path / f"catalog-{len(databases)}.sqlite3")
         database.initialize()
@@ -104,6 +107,7 @@ def pipeline_factory(tmp_path):
                 coming_soon=coming_soon,
                 app_available=app_available,
                 app_list=app_list,
+                app_pages=app_pages,
             ),
             steamspy=FakeSteamSpyClient(steamspy_pages or []),
         )
@@ -424,6 +428,101 @@ def test_steam_fallback_queues_candidates_without_provisional_counts(pipeline_fa
 
     assert (stats.discovered, stats.queued) == (1, 1)
     assert db.job_status("collect", "10") == "pending"
+
+
+def test_steam_discovery_commits_and_reports_each_page(pipeline_factory):
+    pipeline, db = pipeline_factory(
+        app_pages=[
+            [DiscoveryItem(appid=10, name="First", payload_json='{"appid":10}')],
+            [DiscoveryItem(appid=20, name="Missing from SteamSpy", payload_json='{"appid":20}')],
+        ]
+    )
+    events = []
+
+    stats = pipeline.bootstrap("steam", on_progress=events.append)
+
+    assert (stats.discovered, stats.queued) == (2, 2)
+    assert [(event.stage, event.source_page) for event in events] == [
+        ("fetching", 0),
+        ("saved", 0),
+        ("fetching", 1),
+        ("saved", 1),
+    ]
+    assert [
+        tuple(row)
+        for row in db.connection.execute(
+            "SELECT appid, source_page FROM source_items WHERE source = 'steam' ORDER BY appid"
+        )
+    ] == [(10, 0), (20, 1)]
+    assert db.job_status("collect", "20") == "pending"
+
+
+def test_steam_discovery_page_limit_does_not_fetch_next_page(pipeline_factory):
+    pipeline, db = pipeline_factory(
+        app_pages=[
+            [DiscoveryItem(appid=10, payload_json='{"appid":10}')],
+            [DiscoveryItem(appid=20, payload_json='{"appid":20}')],
+        ]
+    )
+
+    stats = pipeline.bootstrap("steam", page_limit=1)
+
+    assert (stats.discovered, stats.queued) == (1, 1)
+    assert pipeline.steam.calls == [("app_page", 0)]
+    assert db.job_status("collect", "20") is None
+
+
+def test_official_discovery_rechecks_steamspy_provisional_rejection_through_steam(
+    pipeline_factory,
+):
+    candidate = DiscoveryItem(appid=10, name="Undercounted", payload_json='{"appid":10}')
+    pipeline, db = pipeline_factory(
+        steamspy_pages=[[item(10, 5)]],
+        app_pages=[[candidate]],
+        review_total=25,
+    )
+    pipeline.bootstrap("steamspy", page_limit=1)
+
+    pipeline.bootstrap("steam")
+    lease = db.claim_specific_job("collect", "10")
+    pipeline.collect_one(10, lease_token=lease["lease_token"])
+
+    assert db.game_status(10) == "eligible"
+    assert ("reviews", 10, "recent", "all", 100) in pipeline.steam.calls
+
+
+def test_refresh_below_verified_threshold_rechecks_all_matches_through_steam(
+    pipeline_factory,
+):
+    pipeline, db = pipeline_factory(review_total=25)
+    for appid in (10, 11):
+        db.record_game_status(
+            appid,
+            "below_verified_threshold",
+            skip_reason="below_verified_threshold",
+            steam_total_reviews=19,
+            reviews_fetched_at="2026-01-01T00:00:00+00:00",
+            replace_steam_aggregate=True,
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        db.enqueue_job("collect", str(appid))
+        db.connection.execute(
+            "UPDATE sync_jobs SET status = 'complete' WHERE item_key = ?", (str(appid),)
+        )
+
+    scheduled = db.schedule_refresh(
+        "2999-01-01T00:00:00+00:00",
+        reason="below_verified_threshold",
+    )
+    for appid in (10, 11):
+        lease = db.claim_specific_job("collect", str(appid))
+        pipeline.collect_one(appid, lease_token=lease["lease_token"])
+
+    assert scheduled == 2
+    assert db.game_status(10) == "eligible"
+    assert db.game_status(11) == "eligible"
+    assert ("reviews", 10, "recent", "all", 100) in pipeline.steam.calls
+    assert ("reviews", 11, "recent", "all", 100) in pipeline.steam.calls
 
 
 def test_repeated_steam_fallback_resume_preserves_terminal_game_and_job_states(
