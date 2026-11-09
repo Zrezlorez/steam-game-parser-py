@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from steam_catalog.config import Settings
 from steam_catalog import pipeline
+from steam_catalog.config import Settings
 
 
 def test_settings_use_project_database_by_default(monkeypatch):
@@ -45,7 +45,6 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("STEAM_CATALOG_STEAMSPY_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("STEAM_CATALOG_STEAMSPY_ALL_INTERVAL_SECONDS", "75")
     monkeypatch.setenv("STEAM_CATALOG_MAX_ATTEMPTS", "4")
-    monkeypatch.setenv("STEAM_CATALOG_CACHE_TTL_HOURS", "72")
     monkeypatch.setenv("STEAM_CATALOG_STEAM_WEB_API_KEY", "  test-key  ")
 
     settings = Settings.from_env()
@@ -57,7 +56,6 @@ def test_settings_parse_matching_environment_variables(monkeypatch, tmp_path: Pa
     assert settings.steamspy_interval_seconds == 2.5
     assert settings.steamspy_all_interval_seconds == 75.0
     assert settings.max_attempts == 4
-    assert settings.cache_ttl_hours == 72
     assert settings.steam_web_api_key == "test-key"
 
 

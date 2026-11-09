@@ -2,13 +2,13 @@
 
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from functools import partial
 from time import monotonic
 from typing import Literal, Protocol, TypeAlias, cast
 
 from steam_catalog.db import Database
 from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
-
+from steam_catalog.utils import utc_now
 
 MIN_REVIEWS = 20
 
@@ -47,7 +47,7 @@ class SteamProvider(Protocol):
 
     def fetch_app_details(self, appid: int) -> GameDetails | None: ...
 
-    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str: ...
+    def fetch_regional_prices(self, appid: int) -> str: ...
 
     def fetch_reviews(
         self, appid: int, filter: str, review_type: str, limit: int
@@ -123,12 +123,14 @@ class CatalogPipeline:
         for source_page, items, started in self._discovery_pages(
             source, resume, page_limit, on_progress
         ):
-            timestamp = _utc_now()
+            timestamp = utc_now()
             page_discovered_appids: set[int] = set()
             page_queued_appids: set[int] = set()
             with self.database.transaction(
-                on_commit=lambda: self._publish_bootstrap_page(
-                    page_discovered_appids, page_queued_appids
+                on_commit=partial(
+                    self._publish_bootstrap_page,
+                    page_discovered_appids,
+                    page_queued_appids,
                 )
             ):
                 for candidate in items:
@@ -202,7 +204,7 @@ class CatalogPipeline:
         if lease_token is None and self.database.job_status("collect", str(appid)):
             raise ValueError("lease_token is required for a queued collect job")
         summary = self.steam.fetch_reviews(appid, "recent", "all", 100)
-        timestamp = _utc_now()
+        timestamp = utc_now()
         aggregate = {
             "steam_total_positive": summary.total_positive,
             "steam_total_negative": summary.total_negative,
@@ -249,7 +251,6 @@ class CatalogPipeline:
         appid: int,
         *,
         lease_token: str | None = None,
-        force_refresh: bool = False,
     ) -> CollectionResult:
         """Fetch and atomically persist USD and UAH for one eligible game."""
         if lease_token is None and self.database.job_status("collect_prices", str(appid)):
@@ -257,8 +258,8 @@ class CatalogPipeline:
         if self.database.game_status(appid) != "eligible":
             raise ValueError(f"appid {appid} is not an eligible game")
 
-        prices_json = self.steam.fetch_regional_prices(appid, force_refresh=force_refresh)
-        timestamp = _utc_now()
+        prices_json = self.steam.fetch_regional_prices(appid)
+        timestamp = utc_now()
         self.database.update_regional_prices(
             appid,
             prices_json,
@@ -281,11 +282,10 @@ class CatalogPipeline:
             "negative": summary.total_negative,
         }
         for sample_prefix, filter_name in (("helpful", "all"), ("recent", "recent")):
-            broad = (
-                recent_page or self.steam.fetch_reviews(appid, filter_name, "all", 100)
-                if sample_prefix == "recent"
-                else self.steam.fetch_reviews(appid, filter_name, "all", 100)
-            )
+            if sample_prefix == "recent" and recent_page is not None:
+                broad = recent_page
+            else:
+                broad = self.steam.fetch_reviews(appid, filter_name, "all", 100)
             for polarity in ("positive", "negative"):
                 target = min(5, aggregate_counts[polarity])
                 selected = select_reviews(broad.reviews, polarity, target)
@@ -356,7 +356,8 @@ class CatalogPipeline:
         resume: bool,
         page_limit: int | None,
         on_progress: Callable[[BootstrapProgressEvent], None] | None,
-    ):
+    ) -> Iterator[tuple[int, list[DiscoveryItem], float]]:
+        """Yield discovery pages together with their source page and fetch start time."""
         if source == "steam":
             pages = iter(self.steam.fetch_app_pages())
             page = 0
@@ -388,7 +389,3 @@ class CatalogPipeline:
                 return
             yield page, items, started
             page += 1
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()

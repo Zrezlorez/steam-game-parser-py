@@ -1,6 +1,6 @@
+import json
 from contextlib import contextmanager
 from dataclasses import replace
-import json
 
 import pytest
 
@@ -72,8 +72,8 @@ class FakeSteamClient:
             return None
         return replace(self.details, appid=appid)
 
-    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str:
-        self.calls.append(("prices", appid, force_refresh))
+    def fetch_regional_prices(self, appid: int) -> str:
+        self.calls.append(("prices", appid))
         return json.dumps(
             {
                 "USD": {"currency": "USD", "final": 999},
@@ -993,17 +993,16 @@ def test_stale_worker_cannot_complete_or_fail_a_reclaimed_lease(initialized_db):
         initialized_db.complete_job(
             "collect", "10", expected_lease_token=stale_lease["lease_token"]
         )
-    with pytest.raises(RuntimeError, match="lease"):
-        with initialized_db.transaction():
-            initialized_db.record_game_status(10, "eligible")
-            initialized_db.fail_job(
-                "collect",
-                "10",
-                "stale worker",
-                expected_lease_token=stale_lease["lease_token"],
-                next_attempt_at="2026-07-21T00:00:00+00:00",
-                max_attempts=3,
-            )
+    with pytest.raises(RuntimeError, match="lease"), initialized_db.transaction():
+        initialized_db.record_game_status(10, "eligible")
+        initialized_db.fail_job(
+            "collect",
+            "10",
+            "stale worker",
+            expected_lease_token=stale_lease["lease_token"],
+            next_attempt_at="2026-07-21T00:00:00+00:00",
+            max_attempts=3,
+        )
 
     row = initialized_db.connection.execute(
         "SELECT status, attempt_count, lease_token FROM sync_jobs WHERE item_key = '10'"

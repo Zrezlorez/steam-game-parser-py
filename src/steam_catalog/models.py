@@ -1,16 +1,16 @@
 """Shared typed domain values and persisted status values."""
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class EligibilityStatus(str, Enum):
+class EligibilityStatus(StrEnum):
     PENDING = "pending"
     ELIGIBLE = "eligible"
     INELIGIBLE = "ineligible"
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"

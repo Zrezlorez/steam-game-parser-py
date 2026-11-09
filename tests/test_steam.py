@@ -1,6 +1,5 @@
-from copy import deepcopy
-from datetime import timedelta
 import json
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -170,7 +169,7 @@ def test_fetch_app_details_uses_only_kz_metadata_and_price(load_fixture):
         def __init__(self):
             self.countries = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
+        def get_json(self, url, *, params, rate_bucket):
             self.countries.append(params["cc"])
             payload = deepcopy(fixture)
             currency = {"KZ": "KZT", "US": "USD", "UA": "UAH"}[params["cc"]]
@@ -194,7 +193,7 @@ def test_fetch_app_details_uses_kz_as_availability_authority():
         def __init__(self):
             self.countries = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+        def get_json(self, url, *, params, rate_bucket):
             self.countries.append(params["cc"])
             return {"10": {"success": False}}
 
@@ -208,7 +207,7 @@ def test_fetch_app_details_keeps_missing_region_and_free_price_explicit(load_fix
     fixture = load_fixture("steam_appdetails.json")
 
     class MixedHttpClient:
-        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
+        def get_json(self, url, *, params, rate_bucket):
             if params["cc"] == "US":
                 return {"10": {"success": False}}
             payload = deepcopy(fixture)
@@ -261,7 +260,7 @@ def test_targeted_review_fetch_accepts_page_local_summary_without_aggregate_tota
     }
 
     class TargetedReviewHttpClient:
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
+        def get_json(self, url, *, params, rate_bucket):
             return payload
 
     page = SteamClient(TargetedReviewHttpClient()).fetch_reviews(10, "all", "negative", 5)
@@ -317,10 +316,10 @@ def test_parse_review_page_rejects_non_exact_success_values(success):
 def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
     class RecordingHttpClient:
         def __init__(self):
-            self.calls: list[tuple[str, dict[str, str], timedelta, str]] = []
+            self.calls: list[tuple[str, dict[str, str], str]] = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket, force_refresh=False):
-            self.calls.append((url, dict(params), cache_ttl, rate_bucket))
+        def get_json(self, url, *, params, rate_bucket):
+            self.calls.append((url, dict(params), rate_bucket))
             if "appdetails" in url:
                 payload = deepcopy(load_fixture("steam_appdetails.json"))
                 payload["10"]["data"]["price_overview"]["currency"] = {
@@ -350,8 +349,7 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
     client = SteamClient(http, api_key="test-key")
 
     assert [
-        ([item.appid for item in page], is_last)
-        for page, is_last in client.fetch_app_pages()
+        ([item.appid for item in page], is_last) for page, is_last in client.fetch_app_pages()
     ] == [([10], False), ([20], True)]
     assert client.fetch_app_details(10) is not None
     assert json.loads(client.fetch_regional_prices(10)) == {
@@ -363,7 +361,6 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
         (
             "https://api.steampowered.com/IStoreService/GetAppList/v1/",
             {"key": "test-key", "include_games": "true", "max_results": "50000"},
-            timedelta(days=7),
             "steam",
         ),
         (
@@ -374,25 +371,21 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
                 "max_results": "50000",
                 "last_appid": "10",
             },
-            timedelta(days=7),
             "steam",
         ),
         (
             "https://store.steampowered.com/api/appdetails",
             {"appids": "10", "cc": "KZ"},
-            timedelta(days=7),
             "steam",
         ),
         (
             "https://store.steampowered.com/api/appdetails",
             {"appids": "10", "cc": "US"},
-            timedelta(days=7),
             "steam",
         ),
         (
             "https://store.steampowered.com/api/appdetails",
             {"appids": "10", "cc": "UA"},
-            timedelta(days=7),
             "steam",
         ),
         (
@@ -404,7 +397,6 @@ def test_fetch_methods_use_steam_bucket_and_documented_parameters(load_fixture):
                 "language": "all",
                 "json": "1",
             },
-            timedelta(days=1),
             "steam",
         ),
     ]

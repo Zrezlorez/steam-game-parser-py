@@ -1,24 +1,20 @@
 """SteamSpy discovery requests and response parsing."""
 
 from collections.abc import Mapping
-from datetime import timedelta
-import json
-import re
 from typing import Any
 
-from steam_catalog.http import CachedHttpClient
+from steam_catalog.http import HttpClient
 from steam_catalog.models import DiscoveryItem
-
+from steam_catalog.sources.common import optional_integer, positive_appid
+from steam_catalog.utils import compact_json
 
 STEAMSPY_API_URL = "https://steamspy.com/api.php"
-CATALOG_CACHE_TTL = timedelta(days=7)
-_BASE_10_INTEGER = re.compile(r"^[0-9]+$")
 
 
 class SteamSpyClient:
-    """Fetch SteamSpy catalog pages through the shared cached HTTP client."""
+    """Fetch SteamSpy catalog pages through the shared HTTP client."""
 
-    def __init__(self, http: CachedHttpClient) -> None:
+    def __init__(self, http: HttpClient) -> None:
         self.http = http
 
     def fetch_page(self, page: int) -> list[DiscoveryItem]:
@@ -26,7 +22,6 @@ class SteamSpyClient:
         payload = self.http.get_json(
             STEAMSPY_API_URL,
             params={"request": "all", "page": str(page)},
-            cache_ttl=CATALOG_CACHE_TTL,
             rate_bucket="steamspy_all",
         )
         return parse_catalog_page(payload)
@@ -38,7 +33,7 @@ def parse_catalog_page(payload: Mapping[str, Any]) -> list[DiscoveryItem]:
     for source_item in payload.values():
         if not isinstance(source_item, Mapping):
             continue
-        appid = _positive_appid(source_item.get("appid"))
+        appid = positive_appid(source_item.get("appid"))
         if appid is None:
             continue
         positive = _review_count(source_item.get("positive"))
@@ -52,36 +47,16 @@ def parse_catalog_page(payload: Mapping[str, Any]) -> list[DiscoveryItem]:
                 provisional_reviews=positive + negative
                 if positive is not None and negative is not None
                 else None,
-                payload_json=_compact_json(source_item),
+                payload_json=compact_json(source_item),
             )
         )
     return items
 
 
-def _positive_appid(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, str) and _BASE_10_INTEGER.fullmatch(value):
-        appid = int(value)
-        return appid if appid > 0 else None
-    return None
-
-
 def _review_count(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and _BASE_10_INTEGER.fullmatch(value):
-        return int(value)
-    return None
+    review_count = optional_integer(value)
+    return review_count if review_count is not None and review_count >= 0 else None
 
 
 def _string_or_empty(value: object) -> str:
     return value if isinstance(value, str) else ""
-
-
-def _compact_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)

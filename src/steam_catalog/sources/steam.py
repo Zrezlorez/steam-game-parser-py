@@ -1,25 +1,31 @@
 """Steam Store and review requests with pure response parsers."""
 
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from html.parser import HTMLParser
-import re
 from typing import Any
 
 import httpx
 
-from steam_catalog.http import CachedHttpClient
+from steam_catalog.errors import SourceRequestError, SourceResponseError
+from steam_catalog.http import HttpClient
 from steam_catalog.models import DiscoveryItem, GameDetails, Review, ReviewPage
-from steam_catalog.sources.steamspy import _compact_json, _positive_appid
-
+from steam_catalog.sources.common import (
+    optional_bool,
+    optional_float,
+    optional_integer,
+    optional_string,
+    positive_appid,
+    required_nonnegative_integer,
+)
+from steam_catalog.utils import compact_json
 
 APP_LIST_URL = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
 APP_LIST_MAX_RESULTS = 50_000
 APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
 REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
-METADATA_CACHE_TTL = timedelta(days=7)
-REVIEWS_CACHE_TTL = timedelta(days=1)
 STORE_REGIONS = (("KZ", "KZT"), ("US", "USD"), ("UA", "UAH"))
 _WHITESPACE = re.compile(r"\s+")
 _STRUCTURAL_BREAK = object()
@@ -55,18 +61,16 @@ _BLOCK_TAGS = frozenset(
 
 
 class SteamClient:
-    """Fetch Steam app metadata and user reviews through cached HTTP."""
+    """Fetch Steam app metadata and user reviews through the shared HTTP client."""
 
-    def __init__(self, http: CachedHttpClient, *, api_key: str | None = None) -> None:
+    def __init__(self, http: HttpClient, *, api_key: str | None = None) -> None:
         self.http = http
         self.api_key = api_key
 
     def fetch_app_pages(self) -> Iterator[tuple[list[DiscoveryItem], bool]]:
         """Yield official Steam game-list pages using a validated advancing cursor."""
         if self.api_key is None:
-            raise ValueError(
-                "STEAM_CATALOG_STEAM_WEB_API_KEY is required for --source steam"
-            )
+            raise ValueError("STEAM_CATALOG_STEAM_WEB_API_KEY is required for --source steam")
         cursor: int | None = None
         while True:
             params = {
@@ -80,21 +84,20 @@ class SteamClient:
                 payload = self.http.get_json(
                     APP_LIST_URL,
                     params=params,
-                    cache_ttl=METADATA_CACHE_TTL,
                     rate_bucket="steam",
                 )
             except httpx.HTTPStatusError as error:
-                raise RuntimeError(
+                raise SourceRequestError(
                     f"Steam app list request failed with HTTP {error.response.status_code}"
                 ) from error
             except httpx.HTTPError as error:
-                raise RuntimeError("Steam app list request failed") from error
+                raise SourceRequestError("Steam app list request failed") from error
             items, have_more, next_cursor = parse_app_list_page(payload)
             yield items, not have_more
             if not have_more:
                 return
             if next_cursor is None or (cursor is not None and next_cursor <= cursor):
-                raise ValueError("Steam app list cursor did not advance")
+                raise SourceResponseError("Steam app list cursor did not advance")
             cursor = next_cursor
 
     def fetch_app_details(self, appid: int) -> GameDetails | None:
@@ -102,28 +105,25 @@ class SteamClient:
         kz_payload = self.http.get_json(
             APP_DETAILS_URL,
             params={"appids": str(appid), "cc": "KZ"},
-            cache_ttl=METADATA_CACHE_TTL,
             rate_bucket="steam",
         )
         details = parse_app_details(appid, kz_payload)
         if details is None:
             return None
         prices = {"KZT": _parse_store_price(appid, kz_payload, "KZT")}
-        return replace(details, prices_json=_compact_json(prices))
+        return replace(details, prices_json=compact_json(prices))
 
-    def fetch_regional_prices(self, appid: int, *, force_refresh: bool = False) -> str:
+    def fetch_regional_prices(self, appid: int) -> str:
         """Fetch the optional US and UA storefront prices."""
         prices: dict[str, object | None] = {}
         for country, currency in STORE_REGIONS[1:]:
             payload = self.http.get_json(
                 APP_DETAILS_URL,
                 params={"appids": str(appid), "cc": country},
-                cache_ttl=METADATA_CACHE_TTL,
                 rate_bucket="steam",
-                force_refresh=force_refresh,
             )
             prices[currency] = _parse_store_price(appid, payload, currency)
-        return _compact_json(prices)
+        return compact_json(prices)
 
     def fetch_reviews(self, appid: int, filter: str, review_type: str, limit: int) -> ReviewPage:
         """Fetch one aggregate and sample review page."""
@@ -136,7 +136,6 @@ class SteamClient:
                 "language": "all",
                 "json": "1",
             },
-            cache_ttl=REVIEWS_CACHE_TTL,
             rate_bucket="steam",
         )
         return parse_review_page(appid, payload, require_aggregate=review_type == "all")
@@ -199,27 +198,27 @@ def parse_app_list_page(
     """Parse one official Steam app-list page and its continuation cursor."""
     response = payload.get("response")
     if not isinstance(response, Mapping) or not isinstance(response.get("apps"), list):
-        raise ValueError("Steam app list response is malformed")
+        raise SourceResponseError("Steam app list response is malformed")
     have_more = response.get("have_more_results")
     if not isinstance(have_more, bool):
-        raise ValueError("Steam app list response is malformed")
+        raise SourceResponseError("Steam app list response is malformed")
     raw_last_appid = response.get("last_appid")
-    last_appid = _positive_appid(raw_last_appid) if raw_last_appid is not None else None
+    last_appid = positive_appid(raw_last_appid) if raw_last_appid is not None else None
     if raw_last_appid is not None and last_appid is None:
-        raise ValueError("Steam app list response is malformed")
+        raise SourceResponseError("Steam app list response is malformed")
     if have_more and last_appid is None:
-        raise ValueError("Steam app list response is malformed")
+        raise SourceResponseError("Steam app list response is malformed")
     items: list[DiscoveryItem] = []
     for source_item in response["apps"]:
         if not isinstance(source_item, Mapping):
             continue
-        appid = _positive_appid(source_item.get("appid"))
+        appid = positive_appid(source_item.get("appid"))
         if appid is not None:
             items.append(
                 DiscoveryItem(
                     appid=appid,
-                    name=_optional_string(source_item.get("name")) or "",
-                    payload_json=_compact_json(source_item),
+                    name=optional_string(source_item.get("name")) or "",
+                    payload_json=compact_json(source_item),
                 )
             )
     return items, have_more, last_appid
@@ -227,29 +226,24 @@ def parse_app_list_page(
 
 def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | None:
     """Parse one Steam Store response and preserve fields approved for storage."""
-    response = payload.get(str(appid))
-    if not isinstance(response, Mapping):
-        raise ValueError("Steam app details response is malformed")
-    if response.get("success") is False:
+    data = _successful_app_data(appid, payload)
+    if data is None:
         return None
-    if response.get("success") is not True or not isinstance(response.get("data"), Mapping):
-        raise ValueError("Steam app details response is malformed")
-    data = response["data"]
     name = data.get("name")
     if not isinstance(name, str):
-        raise ValueError("Steam app details response is malformed")
+        raise SourceResponseError("Steam app details response is malformed")
     release_data = data.get("release_date")
     if release_data is not None and not isinstance(release_data, Mapping):
-        raise ValueError("Steam app details response is malformed")
-    coming_soon = _optional_bool(release_data.get("coming_soon")) if release_data else None
-    release_date = _optional_string(release_data.get("date")) if release_data else None
-    short_html = _optional_string(data.get("short_description"))
-    detailed_html = _optional_string(data.get("detailed_description"))
-    about_html = _optional_string(data.get("about_the_game"))
+        raise SourceResponseError("Steam app details response is malformed")
+    coming_soon = optional_bool(release_data.get("coming_soon")) if release_data else None
+    release_date = optional_string(release_data.get("date")) if release_data else None
+    short_html = optional_string(data.get("short_description"))
+    detailed_html = optional_string(data.get("detailed_description"))
+    about_html = optional_string(data.get("about_the_game"))
     return GameDetails(
         appid=appid,
         name=name,
-        type=_optional_string(data.get("type")),
+        type=optional_string(data.get("type")),
         is_released=not coming_soon if coming_soon is not None else None,
         release_date=release_date,
         coming_soon=coming_soon,
@@ -265,22 +259,29 @@ def parse_app_details(appid: int, payload: Mapping[str, Any]) -> GameDetails | N
         platforms_json=_json_or_none(data.get("platforms")),
         categories_json=_json_or_none(data.get("categories")),
         genres_json=_json_or_none(data.get("genres")),
-        header_image_url=_optional_string(data.get("header_image")),
+        header_image_url=optional_string(data.get("header_image")),
         screenshots_json=_json_or_none(data.get("screenshots")),
     )
+
+
+def _successful_app_data(appid: int, payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    response = payload.get(str(appid))
+    if not isinstance(response, Mapping):
+        raise SourceResponseError("Steam app details response is malformed")
+    if response.get("success") is False:
+        return None
+    data = response.get("data")
+    if response.get("success") is not True or not isinstance(data, Mapping):
+        raise SourceResponseError("Steam app details response is malformed")
+    return data
 
 
 def _parse_store_price(
     appid: int, payload: Mapping[str, Any], expected_currency: str
 ) -> dict[str, Any] | None:
-    response = payload.get(str(appid))
-    if not isinstance(response, Mapping):
-        raise ValueError("Steam app details response is malformed")
-    if response.get("success") is False:
+    data = _successful_app_data(appid, payload)
+    if data is None:
         return None
-    data = response.get("data")
-    if response.get("success") is not True or not isinstance(data, Mapping):
-        raise ValueError("Steam app details response is malformed")
     price = data.get("price_overview")
     if price is None:
         if data.get("is_free") is True:
@@ -292,7 +293,7 @@ def _parse_store_price(
             }
         return None
     if not isinstance(price, Mapping) or price.get("currency") != expected_currency:
-        raise ValueError("Steam app details response has unexpected price currency")
+        raise SourceResponseError("Steam app details response has unexpected price currency")
     return dict(price)
 
 
@@ -312,7 +313,7 @@ def parse_review_page(
         or not isinstance(summary, Mapping)
         or not isinstance(source_reviews, list)
     ):
-        raise ValueError("Steam reviews response is malformed")
+        raise SourceResponseError("Steam reviews response is malformed")
     reviews = tuple(
         parsed
         for source_review in source_reviews
@@ -321,11 +322,11 @@ def parse_review_page(
     )
     aggregate_fields = ("total_reviews", "total_positive", "total_negative")
     if require_aggregate or all(field in summary for field in aggregate_fields):
-        total_reviews = _required_nonnegative_integer(summary.get("total_reviews"))
-        total_positive = _required_nonnegative_integer(summary.get("total_positive"))
-        total_negative = _required_nonnegative_integer(summary.get("total_negative"))
+        total_reviews = _review_count(summary.get("total_reviews"))
+        total_positive = _review_count(summary.get("total_positive"))
+        total_negative = _review_count(summary.get("total_negative"))
     else:
-        total_reviews = _required_nonnegative_integer(summary.get("num_reviews"))
+        total_reviews = _review_count(summary.get("num_reviews"))
         total_positive = sum(review.voted_up for review in reviews)
         total_negative = sum(not review.voted_up for review in reviews)
 
@@ -333,17 +334,21 @@ def parse_review_page(
         total_reviews=total_reviews,
         total_positive=total_positive,
         total_negative=total_negative,
-        review_score=_optional_integer(summary.get("review_score")),
-        review_score_desc=_optional_string(summary.get("review_score_desc")),
+        review_score=optional_integer(summary.get("review_score")),
+        review_score_desc=optional_string(summary.get("review_score_desc")),
         reviews=reviews,
-        cursor=_optional_string(payload.get("cursor")),
+        cursor=optional_string(payload.get("cursor")),
     )
+
+
+def _review_count(value: object) -> int:
+    return required_nonnegative_integer(value, error_message="Steam reviews response is malformed")
 
 
 def _parse_review(appid: int, source: Mapping[str, Any]) -> Review | None:
     recommendation_id = source.get("recommendationid")
-    review_text = _optional_string(source.get("review"))
-    voted_up = _optional_bool(source.get("voted_up"))
+    review_text = optional_string(source.get("review"))
+    voted_up = optional_bool(source.get("voted_up"))
     if isinstance(recommendation_id, bool) or recommendation_id is None or review_text is None:
         return None
     if voted_up is None:
@@ -357,61 +362,24 @@ def _parse_review(appid: int, source: Mapping[str, Any]) -> Review | None:
         appid=appid,
         review_text=review_text,
         voted_up=voted_up,
-        language=_optional_string(source.get("language")),
-        votes_up=_optional_integer(source.get("votes_up")),
-        votes_funny=_optional_integer(source.get("votes_funny")),
-        weighted_vote_score=_optional_float(source.get("weighted_vote_score")),
-        comment_count=_optional_integer(source.get("comment_count")),
-        steam_purchase=_optional_bool(source.get("steam_purchase")),
-        received_for_free=_optional_bool(source.get("received_for_free")),
-        written_during_early_access=_optional_bool(source.get("written_during_early_access")),
-        author_steamid=_optional_string(author.get("steamid")),
-        author_playtime_forever=_optional_integer(author.get("playtime_forever")),
-        author_playtime_at_review=_optional_integer(author.get("playtime_at_review")),
+        language=optional_string(source.get("language")),
+        votes_up=optional_integer(source.get("votes_up")),
+        votes_funny=optional_integer(source.get("votes_funny")),
+        weighted_vote_score=optional_float(source.get("weighted_vote_score")),
+        comment_count=optional_integer(source.get("comment_count")),
+        steam_purchase=optional_bool(source.get("steam_purchase")),
+        received_for_free=optional_bool(source.get("received_for_free")),
+        written_during_early_access=optional_bool(source.get("written_during_early_access")),
+        author_steamid=optional_string(author.get("steamid")),
+        author_playtime_forever=optional_integer(author.get("playtime_forever")),
+        author_playtime_at_review=optional_integer(author.get("playtime_at_review")),
         created_at=_timestamp_to_iso(source.get("timestamp_created")),
         updated_at=_timestamp_to_iso(source.get("timestamp_updated")),
     )
 
 
-def _optional_string(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
-def _optional_bool(value: object) -> bool | None:
-    return value if isinstance(value, bool) else None
-
-
-def _optional_integer(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return None
-
-
-def _required_nonnegative_integer(value: object) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    raise ValueError("Steam reviews response is malformed")
-
-
-def _optional_float(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
-
-
 def _timestamp_to_iso(value: object) -> str | None:
-    timestamp = _optional_integer(value)
+    timestamp = optional_integer(value)
     return datetime.fromtimestamp(timestamp, UTC).isoformat() if timestamp is not None else None
 
 
@@ -420,4 +388,4 @@ def _normalized_or_none(value: str | None) -> str | None:
 
 
 def _json_or_none(value: object) -> str | None:
-    return _compact_json(value) if value is not None else None
+    return compact_json(value) if value is not None else None

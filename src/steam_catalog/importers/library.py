@@ -1,13 +1,13 @@
 """Strict personal Steam library imports keyed by application ID."""
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import json
 from pathlib import Path
 from typing import Any
 
 from steam_catalog.db import Database
-
+from steam_catalog.utils import utc_now
 
 _PLATFORM_FIELDS = {
     "windows": "playtime_windows_forever",
@@ -46,7 +46,7 @@ def import_library(db: Database, path: Path) -> ImportStats:
         raise ValueError("Library file must contain a top-level JSON array")
 
     entries = [_parse_entry(item, index) for index, item in enumerate(payload)]
-    timestamp = datetime.now(UTC).isoformat()
+    timestamp = utc_now()
     placeholders_created = 0
     with db.transaction():
         for entry in entries:

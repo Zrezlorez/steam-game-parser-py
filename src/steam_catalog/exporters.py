@@ -1,16 +1,16 @@
 """Streaming exports for eligible Steam catalog games."""
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 import csv
 import json
 import os
-from pathlib import Path
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, TextIO
 
 from steam_catalog.db import Database
-
+from steam_catalog.utils import decode_json
 
 CSV_COLUMNS = (
     "appid",
@@ -110,7 +110,7 @@ def _game_record(row: Mapping[str, Any]) -> dict[str, Any]:
     record = dict(row)
     owned = bool(record.pop("owned"))
     for database_key, export_key in _JSON_COLUMNS.items():
-        record[export_key] = _decode_json(record.pop(database_key))
+        record[export_key] = decode_json(record.pop(database_key))
     for key in _GAME_BOOLEAN_COLUMNS:
         if record[key] is not None:
             record[key] = bool(record[key])
@@ -121,8 +121,8 @@ def _game_record(row: Mapping[str, Any]) -> dict[str, Any]:
         "playtime_forever_minutes": record.pop("library_playtime_forever_minutes"),
         "playtime_2weeks_minutes": record.pop("library_playtime_2weeks_minutes"),
         "last_played_at": record.pop("library_last_played_at"),
-        "platform_playtimes": _decode_json(record.pop("library_platform_playtime_json")),
-        "source_payload": _decode_json(record.pop("library_source_payload_json")),
+        "platform_playtimes": decode_json(record.pop("library_platform_playtime_json")),
+        "source_payload": decode_json(record.pop("library_source_payload_json")),
         "imported_at": record.pop("library_imported_at"),
     }
     record["library"] = library if owned else None
@@ -174,10 +174,6 @@ def _csv_record(record: Mapping[str, Any]) -> dict[str, Any]:
         if record["prices"] is None
         else json.dumps(record["prices"], ensure_ascii=False, separators=(",", ":")),
     }
-
-
-def _decode_json(value: str | None) -> Any:
-    return None if value is None else json.loads(value)
 
 
 def _csv_boolean(value: Any) -> int | None:

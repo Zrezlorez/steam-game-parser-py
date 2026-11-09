@@ -5,7 +5,6 @@ import pytest
 from steam_catalog.db import Database
 from steam_catalog.models import EligibilityStatus, JobStatus
 
-
 EXPECTED_COLUMNS = {
     "games": [
         "appid",
@@ -578,23 +577,22 @@ def test_review_may_belong_to_multiple_samples_without_duplicate_membership(init
 
 
 def test_repository_upserts_join_outer_transaction_and_roll_back_all_rows(initialized_db):
-    with pytest.raises(RuntimeError, match="abort game"):
-        with initialized_db.transaction():
-            initialized_db.upsert_game(
-                appid=70,
-                name="Half-Life",
-                eligibility_status=EligibilityStatus.ELIGIBLE,
-                updated_at="2026-07-20T00:00:00Z",
-                short_description_text="A resonance cascade changes everything.",
-            )
-            initialized_db.upsert_review(
-                recommendation_id="123",
-                appid=70,
-                review_text="Unforgettable pacing.",
-                voted_up=True,
-                fetched_at="2026-07-20T00:01:00Z",
-            )
-            raise RuntimeError("abort game")
+    with pytest.raises(RuntimeError, match="abort game"), initialized_db.transaction():
+        initialized_db.upsert_game(
+            appid=70,
+            name="Half-Life",
+            eligibility_status=EligibilityStatus.ELIGIBLE,
+            updated_at="2026-07-20T00:00:00Z",
+            short_description_text="A resonance cascade changes everything.",
+        )
+        initialized_db.upsert_review(
+            recommendation_id="123",
+            appid=70,
+            review_text="Unforgettable pacing.",
+            voted_up=True,
+            fetched_at="2026-07-20T00:01:00Z",
+        )
+        raise RuntimeError("abort game")
 
     assert initialized_db.connection.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
     assert initialized_db.connection.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0

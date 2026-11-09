@@ -1,5 +1,4 @@
 from dataclasses import asdict
-from datetime import timedelta
 
 from steam_catalog.sources.steamspy import SteamSpyClient, parse_catalog_page
 
@@ -44,13 +43,13 @@ def test_parse_catalog_page_rejects_invalid_ids_and_preserves_compact_payloads()
     ]
 
 
-def test_fetch_page_uses_steamspy_all_bucket_and_seven_day_cache(load_fixture):
+def test_fetch_page_uses_steamspy_all_bucket(load_fixture):
     class RecordingHttpClient:
         def __init__(self):
-            self.calls: list[tuple[str, dict[str, str], timedelta, str]] = []
+            self.calls: list[tuple[str, dict[str, str], str]] = []
 
-        def get_json(self, url, *, params, cache_ttl, rate_bucket):
-            self.calls.append((url, dict(params), cache_ttl, rate_bucket))
+        def get_json(self, url, *, params, rate_bucket):
+            self.calls.append((url, dict(params), rate_bucket))
             return load_fixture("steamspy_page.json")
 
     http = RecordingHttpClient()
@@ -60,7 +59,6 @@ def test_fetch_page_uses_steamspy_all_bucket_and_seven_day_cache(load_fixture):
         (
             "https://steamspy.com/api.php",
             {"request": "all", "page": "4"},
-            timedelta(days=7),
             "steamspy_all",
         )
     ]

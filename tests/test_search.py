@@ -1,5 +1,5 @@
-from dataclasses import replace
 import sqlite3
+from dataclasses import replace
 
 import pytest
 

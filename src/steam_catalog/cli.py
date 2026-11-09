@@ -1,16 +1,16 @@
 """Typer command-line interface for the Steam catalog collector."""
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from enum import Enum
-from functools import wraps
-from pathlib import Path
 import secrets
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from functools import wraps
+from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar
+from typing import Annotated, Literal, ParamSpec, TypeAlias, TypeVar
 
 import httpx
 import typer
@@ -18,19 +18,19 @@ import typer
 from steam_catalog.config import Settings
 from steam_catalog.db import Database
 from steam_catalog.exporters import export_csv, export_jsonl
-from steam_catalog.http import CachedHttpClient
+from steam_catalog.http import HttpClient
 from steam_catalog.importers.library import import_library
 from steam_catalog.pipeline import BootstrapProgressEvent, CatalogPipeline, RunStats
 from steam_catalog.sources.steam import SteamClient
 from steam_catalog.sources.steamspy import SteamSpyClient
 
 
-class DiscoverySource(str, Enum):
+class DiscoverySource(StrEnum):
     STEAMSPY = "steamspy"
     STEAM = "steam"
 
 
-class ExportFormat(str, Enum):
+class ExportFormat(StrEnum):
     JSONL = "jsonl"
     CSV = "csv"
 
@@ -212,15 +212,12 @@ def _database(settings: Settings) -> Iterator[Database]:
 
 @contextmanager
 def _pipeline(database: Database, settings: Settings) -> Iterator[CatalogPipeline]:
-    http = CachedHttpClient(database=database, settings=settings)
-    try:
+    with HttpClient(settings=settings) as http:
         yield CatalogPipeline(
             database,
             steam=SteamClient(http, api_key=settings.steam_web_api_key),
             steamspy=SteamSpyClient(http),
         )
-    finally:
-        http.close()
 
 
 @app.command("init")
@@ -260,15 +257,17 @@ def bootstrap_command(
     pipeline: CatalogPipeline | None = None
     stats = RunStats()
     try:
-        with _database(settings) as database:
-            with _pipeline(database, settings) as active_pipeline:
-                pipeline = active_pipeline
-                stats = active_pipeline.bootstrap(
-                    source.value,
-                    resume=resume,
-                    page_limit=page_limit,
-                    on_progress=_print_bootstrap_event,
-                )
+        with (
+            _database(settings) as database,
+            _pipeline(database, settings) as active_pipeline,
+        ):
+            pipeline = active_pipeline
+            stats = active_pipeline.bootstrap(
+                source.value,
+                resume=resume,
+                page_limit=page_limit,
+                on_progress=_print_bootstrap_event,
+            )
     except KeyboardInterrupt as error:
         progress = getattr(pipeline, "bootstrap_progress", stats)
         typer.echo("Interrupted; completed discovery pages remain resumable.")
@@ -361,38 +360,57 @@ def _consume_collection_jobs(
     progress: _CollectionProgress,
 ) -> None:
     """Consume collection work while publishing only durable outcomes."""
+    _consume_jobs(
+        database,
+        "collect",
+        limit=limit,
+        progress=progress,
+        queued_count=database.collection_queue_size,
+        collect=lambda item_key, lease_token, sequence, display_total: _collect_claimed_job(
+            database,
+            pipeline,
+            settings,
+            item_key=item_key,
+            lease_token=lease_token,
+            sequence=sequence,
+            display_total=display_total,
+            on_event=on_event,
+            progress=progress,
+        ),
+        reconcile=_reconcile_active_job,
+    )
+
+
+def _consume_jobs(
+    database: Database,
+    job_kind: str,
+    *,
+    limit: int | None,
+    progress: _CollectionProgress,
+    queued_count: Callable[[], int],
+    collect: Callable[[str, str, int, int], None],
+    reconcile: Callable[[Database, str | None, str | None, _CollectionProgress], None],
+) -> None:
+    """Run one resumable job queue, releasing an in-flight lease on interrupt."""
     active_lease_token: str | None = None
     active_item_key: str | None = None
     try:
-        display_total = database.collection_queue_size()
+        display_total = queued_count()
         if limit is not None:
             display_total = min(display_total, limit)
         while limit is None or progress.total < limit:
             active_lease_token = secrets.token_urlsafe(32)
-            lease = database.claim_job("collect", lease_token=active_lease_token)
+            lease = database.claim_job(job_kind, lease_token=active_lease_token)
             if lease is None:
                 active_lease_token = None
                 break
-            item_key = lease["item_key"]
-            active_item_key = item_key
-            try:
-                _collect_claimed_job(
-                    database,
-                    pipeline,
-                    settings,
-                    item_key=item_key,
-                    lease_token=active_lease_token,
-                    sequence=progress.total + 1,
-                    display_total=display_total,
-                    on_event=on_event,
-                    progress=progress,
-                )
-            except _EXPECTED_ERRORS:
-                pass
+            active_item_key = lease["item_key"]
+            with suppress(_EXPECTED_ERRORS):
+                collect(active_item_key, active_lease_token, progress.total + 1, display_total)
             active_lease_token = None
             active_item_key = None
     except KeyboardInterrupt:
-        _reconcile_active_job(database, active_lease_token, active_item_key, progress)
+        reconcile(database, active_lease_token, active_item_key, progress)
         raise
 
 
@@ -519,37 +537,24 @@ def _consume_price_jobs(
     progress: _CollectionProgress,
 ) -> None:
     """Consume resumable regional-price jobs with durable progress output."""
-    active_lease_token: str | None = None
-    active_item_key: str | None = None
-    try:
-        display_total = database.job_queue_size("collect_prices")
-        if limit is not None:
-            display_total = min(display_total, limit)
-        while limit is None or progress.total < limit:
-            active_lease_token = secrets.token_urlsafe(32)
-            lease = database.claim_job("collect_prices", lease_token=active_lease_token)
-            if lease is None:
-                active_lease_token = None
-                break
-            active_item_key = lease["item_key"]
-            try:
-                _collect_claimed_price_job(
-                    database,
-                    pipeline,
-                    settings,
-                    item_key=active_item_key,
-                    lease_token=active_lease_token,
-                    sequence=progress.total + 1,
-                    display_total=display_total,
-                    progress=progress,
-                )
-            except _EXPECTED_ERRORS:
-                pass
-            active_lease_token = None
-            active_item_key = None
-    except KeyboardInterrupt:
-        _reconcile_active_price_job(database, active_lease_token, active_item_key, progress)
-        raise
+    _consume_jobs(
+        database,
+        "collect_prices",
+        limit=limit,
+        progress=progress,
+        queued_count=lambda: database.job_queue_size("collect_prices"),
+        collect=lambda item_key, lease_token, sequence, display_total: _collect_claimed_price_job(
+            database,
+            pipeline,
+            settings,
+            item_key=item_key,
+            lease_token=lease_token,
+            sequence=sequence,
+            display_total=display_total,
+            progress=progress,
+        ),
+        reconcile=_reconcile_active_price_job,
+    )
 
 
 def _reconcile_active_price_job(
@@ -580,12 +585,11 @@ def _collect_claimed_price_job(
     sequence: int,
     display_total: int,
     progress: _CollectionProgress,
-    force_refresh: bool = False,
 ) -> None:
     appid = int(item_key)
     started = monotonic()
     try:
-        pipeline.collect_prices_one(appid, lease_token=lease_token, force_refresh=force_refresh)
+        pipeline.collect_prices_one(appid, lease_token=lease_token)
     except _EXPECTED_ERRORS as error:
         database.fail_job(
             "collect_prices",
@@ -654,7 +658,6 @@ def _collect_specific_prices(
                 sequence=1,
                 display_total=1,
                 progress=progress,
-                force_refresh=True,
             )
     except KeyboardInterrupt:
         _reconcile_active_price_job(database, lease_token, item_key, progress)
@@ -810,6 +813,6 @@ def export_command(
     typer.echo(f"Exported: {count}")
 
 
-def run() -> Any:
+def run() -> None:
     """Invoke the Typer application."""
-    return app()
+    app()

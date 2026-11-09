@@ -11,7 +11,6 @@ from steam_catalog.db import Database
 from steam_catalog.models import DiscoveryItem
 from steam_catalog.pipeline import CatalogPipeline, CollectionResult, RunStats
 
-
 runner = CliRunner()
 
 
@@ -50,15 +49,23 @@ def test_compact_removes_http_cache_and_preserves_catalog_data(tmp_path: Path):
         "eligible",
         updated_at="2026-07-20T00:00:00+00:00",
     )
-    database.upsert_http_cache(
-        cache_key="GET example.test/data?",
-        url="https://example.test/data",
-        status_code=200,
-        response_body='{"raw":"response"}',
-        etag=None,
-        last_modified=None,
-        fetched_at="2026-07-20T00:00:00+00:00",
-        expires_at="2026-07-21T00:00:00+00:00",
+    database.connection.execute(
+        """
+        INSERT INTO http_cache(
+            cache_key, url, status_code, response_body, etag, last_modified,
+            fetched_at, expires_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "GET example.test/data?",
+            "https://example.test/data",
+            200,
+            '{"raw":"response"}',
+            None,
+            None,
+            "2026-07-20T00:00:00+00:00",
+            "2026-07-21T00:00:00+00:00",
+        ),
     )
     database.close()
 

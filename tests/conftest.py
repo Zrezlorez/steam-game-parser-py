@@ -48,7 +48,6 @@ def http_client_factory(initialized_db: Database):
             **settings_overrides,
         )
         client = CachedHttpClient(
-            database=initialized_db,
             settings=settings,
             transport=httpx.MockTransport(handler),
             sleep=sleep,

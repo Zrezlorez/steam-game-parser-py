@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
 .test-deps/
 build/
 dist/
@@ -12,6 +16,10 @@ data/*.sqlite3
 
 # Local IDE, personal library, and SQLite runtime state
 .idea/
+.vscode/
 data/steam_info.json
 *.sqlite3-wal
 *.sqlite3-shm
+*.log
+.DS_Store
+Thumbs.db
